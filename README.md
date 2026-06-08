@@ -131,3 +131,15 @@ build-x64-windows-vulkan-release\bin\llama-bench.exe -m .\mymodels\gemma-4-12b-i
 ```
 
 `pp128` = prompt processing (128 tokens), `tg64` = text generation (64 tokens). Build: `0dbfa66a1 (9512)`.
+
+## Local model performance (ROCm/HIP)
+
+Backend model used by the agent: `gemma-4-12b-it-Q4_K_M.gguf` (6.62 GiB, 11.91 B params), measured with `llama-bench`.
+
+| model | size | params | backend | ngl | test | t/s |
+| --- | --: | --: | --- | --: | --- | --: |
+| gemma4 12B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | pp128 | 58.63 +/- 0.10 |
+| gemma4 12B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | pp512 | 57.64 +/- 0.49 |
+| gemma4 12B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | pp2048 | 52.87 +/- 0.25 |
+| gemma4 12B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | tg128 | 9.19 +/- 0.01 |
+| gemma4 12B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | tg256 | 9.12 +/- 0.01 |
