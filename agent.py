@@ -2,12 +2,16 @@
 """mini local agent: a tiny ReAct coding agent for an OpenAI-compatible local server (llama.cpp)."""
 
 import argparse
+import atexit
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import urllib.request
 import urllib.error
 
@@ -20,6 +24,13 @@ for _stream in (sys.stdout, sys.stderr, sys.stdin):
 
 MAX_OBS_CHARS = 6000  # cap observation size fed back into context to keep prompts small
 MAX_READ_CHARS = 8000
+
+# Defaults for auto-launching llama-server. Override via CLI flags.
+DEFAULT_SERVER_BIN = r"C:\Users\bookery\llama.cpp\build-x64-windows-vulkan-release\bin\llama-server.exe"
+DEFAULT_MODEL_PATH = r"C:\Users\bookery\llama.cpp\mymodels\gemma-4-12b-it-GGUF\gemma-4-12b-it-Q4_K_M.gguf"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8080
+DEFAULT_NGL = 99
 
 SYSTEM_PROMPT = """You are a minimal coding agent. You solve the user's task by calling tools, one step at a time.
 
@@ -55,8 +66,126 @@ Rules:
 - Keep reasoning brief. When the task is done, call finish."""
 
 
+CONVENTION_FILENAMES = ["AGENTS.md", "AGENT.md", ".agentrc", "conventions.md"]
+
+
+def load_conventions(explicit_path=None):
+    """Load project-specific conventions to inject into the system prompt.
+
+    Looks for an explicit --notes file first, then well-known filenames in the
+    working directory. This gives the agent persistent project rules (e.g. "use
+    make run", "compile with --offload-arch=gfx1150") it would otherwise forget.
+    """
+    candidates = []
+    if explicit_path:
+        candidates.append(explicit_path)
+    candidates += [os.path.join(os.getcwd(), name) for name in CONVENTION_FILENAMES]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read().strip()
+            except OSError:
+                continue
+            if text:
+                return path, text
+    return None, None
+
+
+def _server_root(base_url):
+    """Strip a trailing /v1 so we can hit llama.cpp's /health endpoint."""
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    return root
+
+
+def server_is_up(base_url, timeout=2.0):
+    """Return True if a llama.cpp server already answers at base_url."""
+    health = _server_root(base_url) + "/health"
+    try:
+        with urllib.request.urlopen(health, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def start_server(server_bin, model_path, host, port, ngl, ctx_size, extra_args, log_path):
+    """Launch llama-server as a child process; return the Popen handle."""
+    if not os.path.isfile(server_bin):
+        raise RuntimeError(f"llama-server not found: {server_bin} (pass --server-bin)")
+    if not os.path.isfile(model_path):
+        raise RuntimeError(f"model file not found: {model_path} (pass --model-path)")
+    cmd = [
+        server_bin,
+        "-m", model_path,
+        "--host", host,
+        "--port", str(port),
+        "-ngl", str(ngl),
+    ]
+    if ctx_size:
+        cmd += ["-c", str(ctx_size)]
+    if extra_args:
+        cmd += extra_args
+    print(f"[starting llama-server] {' '.join(cmd)}")
+    print(f"[server log] {log_path}")
+    log = open(log_path, "w", encoding="utf-8", errors="replace")
+    # New process group so we can terminate it cleanly on Windows and POSIX.
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, **kwargs)
+    proc._log_handle = log  # keep a reference so it isn't garbage collected
+    return proc
+
+
+def wait_for_server(base_url, proc, timeout=300):
+    """Poll /health until the server is ready, or fail if it exits early."""
+    deadline = time.time() + timeout
+    print("[waiting for server to be ready] ", end="", flush=True)
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            print()
+            raise RuntimeError(
+                f"llama-server exited early (code {proc.returncode}); "
+                f"check the server log for details."
+            )
+        if server_is_up(base_url, timeout=2.0):
+            print(" ready")
+            return True
+        print(".", end="", flush=True)
+        time.sleep(1.0)
+    print()
+    raise RuntimeError(f"server did not become ready within {timeout}s")
+
+
+def stop_server(proc):
+    """Terminate the llama-server child process and close its log file."""
+    if proc is None or proc.poll() is not None:
+        return
+    print("\n[stopping llama-server]")
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    except Exception:
+        pass
+    finally:
+        handle = getattr(proc, "_log_handle", None)
+        if handle:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
 def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=True,
-             stop_on_action=True):
+             stop_on_action=True, stall_timeout=180):
     """Call /chat/completions. Streams tokens to stdout and returns the full assistant text."""
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
@@ -78,57 +207,105 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
     )
 
     try:
-        resp = urllib.request.urlopen(req)
+        resp = urllib.request.urlopen(req, timeout=max(stall_timeout * 2, 60))
     except urllib.error.URLError as e:
         raise RuntimeError(f"Failed to connect to local model server {url}: {e}")
 
     if not stream:
         body = json.loads(resp.read().decode("utf-8"))
-        text = body["choices"][0]["message"]["content"]
+        choice = body["choices"][0]
+        text = choice["message"]["content"]
         print(text, end="", flush=True)
         print()
-        return text
+        return text, choice.get("finish_reason")
+
+    # Read the HTTP stream in a background thread and hand lines to the main thread
+    # via a queue. On Windows a blocking socket read does NOT let Python deliver
+    # KeyboardInterrupt until the read returns; polling the queue with a short
+    # timeout keeps the main thread responsive so Ctrl+C works immediately.
+    q = queue.Queue(maxsize=10000)
+    stop = threading.Event()
+
+    def _reader():
+        try:
+            for raw in resp:
+                if stop.is_set():
+                    break
+                q.put(raw)
+        except Exception as e:  # noqa: BLE001 - socket closed/aborted surfaces here
+            q.put(e)
+        finally:
+            q.put(None)  # sentinel: stream finished
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
 
     parts = []
     in_reasoning = False
-    for raw in resp:
-        line = raw.decode("utf-8").strip()
-        if not line or not line.startswith("data:"):
-            continue
-        chunk = line[len("data:"):].strip()
-        if chunk == "[DONE]":
-            break
-        try:
-            obj = json.loads(chunk)
-        except json.JSONDecodeError:
-            continue
-        delta = obj.get("choices", [{}])[0].get("delta", {})
-        # Reasoning tokens arrive separately; show them so output never looks frozen.
-        reasoning = delta.get("reasoning_content")
-        if reasoning:
-            if not in_reasoning:
-                print("[thinking] ", end="", flush=True)
-                in_reasoning = True
-            print(reasoning, end="", flush=True)
-        piece = delta.get("content")
-        if piece:
-            if in_reasoning:
-                print("\n", end="", flush=True)
-                in_reasoning = False
-            parts.append(piece)
-            print(piece, end="", flush=True)
-            # Early stop: once a full ACTION is available, don't wait for the model
-            # to keep rambling (it often appends extra actions/text up to max_tokens).
-            if stop_on_action and "}" in piece:
-                joined = "".join(parts)
-                if "ACTION" in joined and parse_action(joined) is not None:
-                    break
+    finish_reason = None
+    last_data = time.time()
     try:
-        resp.close()
-    except Exception:
-        pass
+        while True:
+            try:
+                raw = q.get(timeout=0.2)
+            except queue.Empty:
+                # Inactivity watchdog: abort if the model produces nothing for a
+                # while (stalled/busy server) instead of hanging on a fixed total
+                # timeout. Healthy streaming resets last_data on every chunk.
+                if time.time() - last_data > stall_timeout:
+                    raise RuntimeError(
+                        f"no output from the model for {stall_timeout}s "
+                        "(server may be stalled or busy; try restarting it)")
+                continue  # also gives the main thread a chance to see Ctrl+C
+            last_data = time.time()
+            if raw is None:
+                break
+            if isinstance(raw, Exception):
+                raise RuntimeError(f"stream read failed: {raw}")
+            line = raw.decode("utf-8").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            chunk = line[len("data:"):].strip()
+            if chunk == "[DONE]":
+                break
+            try:
+                obj = json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+            choice = obj.get("choices", [{}])[0]
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+            delta = choice.get("delta", {})
+            # Reasoning tokens arrive separately; show them so output never looks frozen.
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                if not in_reasoning:
+                    print("[thinking] ", end="", flush=True)
+                    in_reasoning = True
+                print(reasoning, end="", flush=True)
+            piece = delta.get("content")
+            if piece:
+                if in_reasoning:
+                    print("\n", end="", flush=True)
+                    in_reasoning = False
+                parts.append(piece)
+                print(piece, end="", flush=True)
+                # Early stop: once a full ACTION is available, don't wait for the
+                # model to keep rambling (it often appends text up to max_tokens).
+                if stop_on_action and "}" in piece:
+                    joined = "".join(parts)
+                    if "ACTION" in joined and parse_action(joined) is not None:
+                        finish_reason = "stop"  # complete action; not truncated
+                        break
+    finally:
+        # Unblock and tear down the reader thread (closing the socket aborts its read).
+        stop.set()
+        try:
+            resp.close()
+        except Exception:
+            pass
     print()
-    return "".join(parts)
+    return "".join(parts), finish_reason
 
 
 def list_dir(args):
@@ -257,7 +434,13 @@ def parse_action(text):
     try:
         obj = json.loads(candidate)
     except json.JSONDecodeError:
-        return None
+        # Models frequently emit raw Windows paths like ".\WorkDir\app.exe".
+        # Backslashes such as \W or \h are invalid JSON escapes, so escape any
+        # backslash that isn't part of a valid escape and try once more.
+        try:
+            obj = json.loads(re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", candidate))
+        except json.JSONDecodeError:
+            return None
     if isinstance(obj, dict) and "tool" in obj:
         args = obj.get("args")
         if not isinstance(args, dict):
@@ -315,14 +498,18 @@ def run_tool(action, auto_yes):
         return f"ERROR: {type(e).__name__}: {e}"
 
 
-def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens, think):
+def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens, think,
+               stall_timeout=180):
     messages.append({"role": "user", "content": task})
     repeats = 0
     last_signature = None
     empty_retried = False
+    parse_fails = 0
     for step in range(1, max_steps + 1):
         print(f"\n=== step {step} ===")
-        reply = call_llm(base_url, model, messages, max_tokens=max_tokens, think=think)
+        reply, finish_reason = call_llm(base_url, model, messages,
+                                        max_tokens=max_tokens, think=think,
+                                        stall_timeout=stall_timeout)
 
         # The model occasionally returns an empty assistant turn; retry once before
         # giving up so a single stray empty reply does not silently drop the task.
@@ -335,14 +522,48 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
             print("[model returned an empty reply again, please retry or rephrase]")
             return
         empty_retried = False
-        messages.append({"role": "assistant", "content": reply})
 
         action = parse_action(reply)
         if action is None:
+            if "ACTION" in reply:
+                parse_fails += 1
+                if parse_fails >= 3:
+                    print("\n[could not parse an action 3 times, returning; please rephrase]")
+                    return
+                # Keep a short placeholder (not the huge broken blob) so history
+                # stays small and role alternation is preserved.
+                if finish_reason == "length":
+                    # The action wasn't malformed JSON -- it was cut off at the token
+                    # limit (typically a whole-file write_file). Raise the budget and
+                    # steer toward a smaller, surgical edit.
+                    max_tokens = min(max_tokens * 2, 16384)
+                    print(f"\n[action was cut off at the token limit; raising budget to "
+                          f"{max_tokens} and asking for a smaller edit]")
+                    messages.append({"role": "assistant",
+                                     "content": "[previous action was cut off at the token limit]"})
+                    messages.append({"role": "user", "content": (
+                        "OBSERVATION:\nERROR: your previous ACTION was cut off because it "
+                        "exceeded the output token limit. Do NOT rewrite the whole file in one "
+                        "write_file. Make a small, targeted change with str_replace, or write "
+                        "the file in several smaller str_replace steps.")})
+                    continue
+                print("\n[could not parse the ACTION JSON, asking the model to fix it]")
+                messages.append({"role": "assistant",
+                                 "content": "[previous action was not valid JSON]"})
+                messages.append({"role": "user", "content": (
+                    "OBSERVATION:\nERROR: your ACTION was not valid JSON and could not "
+                    "be parsed. Emit exactly one ACTION followed by a single valid JSON "
+                    "object. Escape every backslash in Windows paths as \\\\ (e.g. "
+                    '".\\\\WorkDir\\\\hip_gemm.exe"), or just use forward slashes '
+                    '("./WorkDir/hip_gemm.exe").')})
+                continue
             # No tool call -> treat as a normal chat reply and hand control back
             # to the user instead of looping autonomously (fixes "stuck in loop"
             # on conversational input like "hello").
+            messages.append({"role": "assistant", "content": reply})
             return
+        parse_fails = 0
+        messages.append({"role": "assistant", "content": reply})
 
         if action["tool"] == "finish":
             answer = action.get("args", {}).get("answer", "")
@@ -366,7 +587,12 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
 
         if len(result) > MAX_OBS_CHARS:
             result = result[:MAX_OBS_CHARS] + "\n... [truncated]"
-        print(f"\n[observation]\n{result[:500]}{'...' if len(result) > 500 else ''}")
+        # Show command output in full (that's the point of running it); keep a short
+        # preview for other tools so the console doesn't flood with file contents.
+        if action["tool"] == "run_shell":
+            print(f"\n[observation]\n{result}")
+        else:
+            print(f"\n[observation]\n{result[:500]}{'...' if len(result) > 500 else ''}")
         messages.append({"role": "user", "content": f"OBSERVATION:\n{result}"})
 
     print("\n[reached max steps, stopping]")
@@ -374,41 +600,97 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
 
 def main():
     parser = argparse.ArgumentParser(description="mini local coding agent")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8080/v1",
-                        help="OpenAI-compatible endpoint (default: llama-server)")
+    parser.add_argument("--base-url", default=None,
+                        help="OpenAI-compatible endpoint; default built from --host/--port")
     parser.add_argument("--model", default="local",
                         help="model name (usually ignored by llama-server, any value works)")
     parser.add_argument("--yes", action="store_true",
                         help="skip confirmation before writing files / running commands")
     parser.add_argument("--max-steps", type=int, default=20,
                         help="max steps per task")
-    parser.add_argument("--max-tokens", type=int, default=2048,
-                        help="max tokens generated per step (prevents long unresponsive runs)")
+    parser.add_argument("--max-tokens", type=int, default=4096,
+                        help="max tokens generated per step (auto-raised if an action is "
+                             "truncated; prevents long unresponsive runs)")
     parser.add_argument("--think", action="store_true",
                         help="enable model reasoning/thinking; disabled by default to avoid stalls")
+    parser.add_argument("--notes", default=None,
+                        help="path to a project conventions file injected into the system prompt "
+                             "(default: auto-detect AGENTS.md in the working directory)")
+    # llama-server lifecycle.
+    parser.add_argument("--no-server", action="store_true",
+                        help="do not launch llama-server; connect to an already-running one")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="llama-server host")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="llama-server port")
+    parser.add_argument("--server-bin", default=DEFAULT_SERVER_BIN,
+                        help="path to llama-server executable")
+    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH,
+                        help="path to the .gguf model to serve")
+    parser.add_argument("--ngl", type=int, default=DEFAULT_NGL,
+                        help="number of layers to offload to GPU")
+    parser.add_argument("--ctx-size", type=int, default=0,
+                        help="context size (-c); 0 leaves the server default")
+    parser.add_argument("--server-arg", action="append", default=[], metavar="ARG",
+                        help="extra raw argument passed to llama-server (repeatable)")
+    parser.add_argument("--server-timeout", type=int, default=300,
+                        help="seconds to wait for the server to become ready")
+    parser.add_argument("--stall-timeout", type=int, default=180,
+                        help="abort a step if the model streams no output for this many seconds")
     args = parser.parse_args()
 
-    print(f"mini-agent -> {args.base_url} (model={args.model})")
+    base_url = args.base_url or f"http://{args.host}:{args.port}/v1"
+
+    proc = None
+    if not args.no_server:
+        if server_is_up(base_url):
+            print(f"[llama-server already running at {base_url}, reusing it]")
+        else:
+            log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.log")
+            proc = start_server(args.server_bin, args.model_path, args.host, args.port,
+                                args.ngl, args.ctx_size, args.server_arg, log_path)
+            atexit.register(stop_server, proc)
+            try:
+                wait_for_server(base_url, proc, timeout=args.server_timeout)
+            except RuntimeError as e:
+                stop_server(proc)
+                print(f"\nError: {e}")
+                return
+    else:
+        if not server_is_up(base_url):
+            print(f"[warning] no server reachable at {base_url}; "
+                  "start one or drop --no-server")
+
+    print(f"mini-agent -> {base_url} (model={args.model})")
     print("Enter a task and press Enter; empty line or Ctrl+C to quit.\n")
 
     system_content = f"{SYSTEM_PROMPT}\n\nWorking directory: {os.getcwd()}\nAll relative paths resolve against this directory."
+    conv_path, conv_text = load_conventions(args.notes)
+    if conv_text:
+        system_content += (
+            f"\n\nProject conventions (from {os.path.basename(conv_path)}; "
+            f"follow these strictly):\n{conv_text}"
+        )
+        print(f"[loaded conventions from {conv_path}]")
     messages = [{"role": "system", "content": system_content}]
-    while True:
-        try:
-            task = input("task> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nbye")
-            break
-        if not task:
-            print("bye")
-            break
-        try:
-            agent_loop(args.base_url, args.model, task, messages, args.yes,
-                       args.max_steps, args.max_tokens, args.think)
-        except RuntimeError as e:
-            print(f"\nError: {e}")
-        except KeyboardInterrupt:
-            print("\n[current task interrupted]")
+    try:
+        while True:
+            try:
+                task = input("task> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nbye")
+                break
+            if not task:
+                print("bye")
+                break
+            try:
+                agent_loop(base_url, args.model, task, messages, args.yes,
+                           args.max_steps, args.max_tokens, args.think,
+                           stall_timeout=args.stall_timeout)
+            except RuntimeError as e:
+                print(f"\nError: {e}")
+            except KeyboardInterrupt:
+                print("\n[current task interrupted]")
+    finally:
+        stop_server(proc)
 
 
 if __name__ == "__main__":

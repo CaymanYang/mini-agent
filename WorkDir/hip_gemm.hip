@@ -58,12 +58,15 @@ int main() {
     hipEventCreate(&stop);
 
     dim3 gridSize((N + blockSize.x - 1) / blockSize.x, (M + blockSize.y - 1) / blockSize.y);
-    dim3 gridSize((N + blockSize.x - 1) / blockSize.x, (M + blockSize.y - 1) / blockSize.y);
 
     // hipLaunchKernelGGL is a statement macro: (kernel, grid, block, sharedMemBytes, stream, args...)
     hipEventRecord(start);
     hipLaunchKernelGGL(gemm_fp16_kernel, gridSize, blockSize, 0, 0, d_A, d_B, d_C, M, K, N);
     hipEventRecord(stop);
+    hipEventSynchronize(stop);
+    float milliseconds = 0;
+    hipEventElapsedTime(&milliseconds, start, stop);
+    printf("Execution time: %.3f ms\n", milliseconds);
 
     hipError_t error = hipGetLastError();
     if (error != hipSuccess) {
