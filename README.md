@@ -113,33 +113,28 @@ Then run the generated program:
 .\hip_gemm.exe
 ```
 
-## Local model performance (Vulkan)
+## Local model performance (ROCm/HIP and Vulkan)
 
-Backend model used by the agent: `gemma-4-12b-it-Q4_K_M.gguf` (6.62 GiB, 11.91 B params), measured with `llama-bench`.
+Backend model used by the agent: `gemma-4-12b-it-Q4_K_M.gguf` (6.62 GiB, 11.91 B params), measured with `llama-bench` on Linux.
 
-Device: AMD Radeon(TM) 890M Graphics (Vulkan, AMD proprietary driver) | uma: 1 | fp16: 1 | bf16: 1 | warp size: 64 | KHR_coopmat
+ROCm/HIP device: AMD Radeon Graphics, `gfx1150` (0x1150), VMM: no, wave size: 32, VRAM: 30947 MiB.
 
-| model | backend | ngl | test | t/s |
-| --- | --- | --: | --- | --: |
-| gemma4 12B Q4_K - Medium | Vulkan | 99 | pp128 | 82.98 ± 0.97 |
-| gemma4 12B Q4_K - Medium | Vulkan | 99 | tg64 | 8.85 ± 0.02 |
-
-Command:
-
-```powershell
-build-x64-windows-vulkan-release\bin\llama-bench.exe -m .\mymodels\gemma-4-12b-it-GGUF\gemma-4-12b-it-Q4_K_M.gguf -ngl 99 -p 128 -n 64
-```
-
-`pp128` = prompt processing (128 tokens), `tg64` = text generation (64 tokens). Build: `0dbfa66a1 (9512)`.
-
-## Local model performance (ROCm/HIP)
-
-Backend model used by the agent: `gemma-4-12b-it-Q4_K_M.gguf` (6.62 GiB, 11.91 B params), measured with `llama-bench`.
+Vulkan device: AMD Radeon Graphics (RADV GFX1150) (`radv`) | uma: 1 | fp16: 1 | bf16: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat.
 
 | model | size | params | backend | ngl | test | t/s |
 | --- | --: | --: | --- | --: | --- | --: |
-| gemma4 12B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | pp128 | 58.63 +/- 0.10 |
-| gemma4 12B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | pp512 | 57.64 +/- 0.49 |
-| gemma4 12B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | pp2048 | 52.87 +/- 0.25 |
-| gemma4 12B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | tg128 | 9.19 +/- 0.01 |
-| gemma4 12B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | tg256 | 9.12 +/- 0.01 |
+| gemma4 ?B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | pp128 | 260.66 ± 5.06 |
+| gemma4 ?B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | tg128 | 10.15 ± 0.01 |
+| gemma4 ?B Q4_K - Medium | 6.62 GiB | 11.91 B | ROCm | 999 | tg256 | 10.11 ± 0.01 |
+| gemma4 ?B Q4_K - Medium | 6.62 GiB | 11.91 B | Vulkan | 999 | pp128 | 198.52 ± 1.28 |
+| gemma4 ?B Q4_K - Medium | 6.62 GiB | 11.91 B | Vulkan | 999 | tg128 | 9.86 ± 0.01 |
+| gemma4 ?B Q4_K - Medium | 6.62 GiB | 11.91 B | Vulkan | 999 | tg256 | 9.82 ± 0.00 |
+
+Commands:
+
+```bash
+./build-hip/bin/llama-bench -m mymodels/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q4_K_M.gguf -ngl 999 -p 128 -n 128,256
+./build-vulkan/bin/llama-bench -m mymodels/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q4_K_M.gguf -ngl 999 -p 128 -n 128,256
+```
+
+`pp128` = prompt processing (128 tokens), `tg128` / `tg256` = text generation. Build: `d403f00ec (9554)`.
