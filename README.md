@@ -13,6 +13,49 @@ Design goal: faster than Roo / Cline. Local models only do prompt processing at 
 
    Override either with `--server-bin` / `--model-path`. If a server is already running at the target URL, the agent detects it and reuses it instead of starting a new one. Use `--no-server` to skip launching entirely and connect to an existing server.
 
+## llama.cpp backend requirements
+
+You need a `llama-server` binary with the backend you want to use. You can use a packaged/prebuilt llama.cpp release if it includes the right backend, or build llama.cpp from source.
+
+Platform support:
+
+- Vulkan supports both Windows and Linux.
+- ROCm/HIP is Linux-only for llama.cpp.
+
+Common requirements:
+
+- A `.gguf` model file, for example `gemma-4-12b-it-Q4_K_M.gguf`.
+- CMake and a C/C++ compiler.
+- Vulkan builds need a Vulkan-capable GPU driver and Vulkan SDK/tools (`glslc`).
+- ROCm/HIP builds need ROCm installed and AMD GPU access. On Linux, the user usually needs to be in the `render` and `video` groups.
+
+Build llama.cpp with Vulkan on Windows:
+
+```powershell
+cd C:\Users\bookery\llama.cpp
+cmake -S . -B build-x64-windows-vulkan-release -DGGML_VULKAN=ON
+cmake --build build-x64-windows-vulkan-release --config Release --target llama-server llama-bench
+```
+
+Build llama.cpp with Vulkan on Linux:
+
+```bash
+cd /home/bookery/llama.cpp
+cmake -S . -B build-vulkan -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vulkan --target llama-server llama-bench -- -j"$(nproc)"
+```
+
+Build llama.cpp with ROCm/HIP on Linux:
+
+```bash
+cd /home/bookery/llama.cpp
+HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+cmake -S . -B build-hip -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-hip --target llama-server llama-bench -- -j"$(nproc)"
+```
+
+After building, pass the matching server path with `--server-bin`, or update the default path in `agent.py`.
+
 ## Usage
 
 ```powershell
