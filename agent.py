@@ -3,6 +3,7 @@
 
 import argparse
 import atexit
+import glob
 import json
 import os
 import queue
@@ -26,11 +27,16 @@ MAX_OBS_CHARS = 6000  # cap observation size fed back into context to keep promp
 MAX_READ_CHARS = 8000
 
 # Defaults for auto-launching llama-server. Override via CLI flags.
-DEFAULT_SERVER_BIN = r"C:\Users\bookery\llama.cpp\build-x64-windows-vulkan-release\bin\llama-server.exe"
-DEFAULT_MODEL_PATH = r"C:\Users\bookery\llama.cpp\mymodels\gemma-4-12b-it-GGUF\gemma-4-12b-it-Q4_K_M.gguf"
+DEFAULT_MODEL_REL = os.path.join(
+    "mymodels", "gemma-4-12b-it-GGUF", "gemma-4-12b-it-Q4_K_M.gguf"
+)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 DEFAULT_NGL = 99
+BACKEND_BUILD_DIRS = {
+    "vulkan": ["build-vulkan", "build-x64-windows-vulkan-release"],
+    "hip": ["build-hip"],
+}
 
 SYSTEM_PROMPT = """You are a minimal coding agent. You solve the user's task by calling tools, one step at a time.
 
@@ -90,6 +96,96 @@ def load_conventions(explicit_path=None):
             if text:
                 return path, text
     return None, None
+
+
+def _unique_existing_dirs(paths):
+    result = []
+    seen = set()
+    for path in paths:
+        if not path:
+            continue
+        path = os.path.abspath(os.path.expanduser(path))
+        key = os.path.normcase(path)
+        if key not in seen and os.path.isdir(path):
+            seen.add(key)
+            result.append(path)
+    return result
+
+
+def find_llama_roots():
+    """Return likely llama.cpp checkout locations."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    home = os.path.expanduser("~")
+    candidates = [
+        os.environ.get("LLAMA_CPP_DIR"),
+        os.getcwd(),
+        os.path.join(os.getcwd(), "llama.cpp"),
+        os.path.join(os.path.dirname(script_dir), "llama.cpp"),
+        os.path.join(home, "llama.cpp"),
+    ]
+    if os.name == "nt":
+        candidates.append(r"C:\Users\bookery\llama.cpp")
+    return _unique_existing_dirs(candidates)
+
+
+def _server_executable_name():
+    return "llama-server.exe" if os.name == "nt" else "llama-server"
+
+
+def _backend_order(backend):
+    if backend != "auto":
+        return [backend]
+    # Vulkan is the portable default. HIP can still be selected explicitly.
+    return ["vulkan", "hip"]
+
+
+def resolve_server_bin(explicit_path, backend):
+    """Find a llama-server binary for the selected backend."""
+    if explicit_path:
+        return os.path.abspath(os.path.expanduser(explicit_path))
+    if backend == "hip" and os.name == "nt":
+        raise RuntimeError("ROCm/HIP backend is Linux-only; use --backend vulkan on Windows")
+
+    exe = _server_executable_name()
+    searched = []
+    for root in find_llama_roots():
+        for name in _backend_order(backend):
+            if name == "hip" and os.name == "nt":
+                continue
+            for build_dir in BACKEND_BUILD_DIRS[name]:
+                path = os.path.join(root, build_dir, "bin", exe)
+                searched.append(path)
+                if os.path.isfile(path):
+                    return path
+    raise RuntimeError(
+        "llama-server not found for backend "
+        f"{backend!r}; pass --server-bin or build llama.cpp first. Searched:\n"
+        + "\n".join(f"  - {path}" for path in searched)
+    )
+
+
+def resolve_model_path(explicit_path):
+    """Find the default GGUF model near a llama.cpp checkout."""
+    if explicit_path:
+        return os.path.abspath(os.path.expanduser(explicit_path))
+
+    searched = []
+    for root in find_llama_roots():
+        preferred = os.path.join(root, DEFAULT_MODEL_REL)
+        searched.append(preferred)
+        if os.path.isfile(preferred):
+            return preferred
+
+        matches = sorted(glob.glob(os.path.join(root, "mymodels", "**", "*.gguf"),
+                                   recursive=True))
+        searched.append(os.path.join(root, "mymodels", "**", "*.gguf"))
+        if matches:
+            return matches[0]
+
+    raise RuntimeError(
+        "model file not found; pass --model-path. Searched:\n"
+        + "\n".join(f"  - {path}" for path in searched)
+    )
 
 
 def _server_root(base_url):
@@ -621,10 +717,12 @@ def main():
                         help="do not launch llama-server; connect to an already-running one")
     parser.add_argument("--host", default=DEFAULT_HOST, help="llama-server host")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="llama-server port")
-    parser.add_argument("--server-bin", default=DEFAULT_SERVER_BIN,
-                        help="path to llama-server executable")
-    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH,
-                        help="path to the .gguf model to serve")
+    parser.add_argument("--backend", choices=["auto", "vulkan", "hip"], default="auto",
+                        help="backend build to auto-detect for llama-server")
+    parser.add_argument("--server-bin", default=None,
+                        help="path to llama-server executable (default: auto-detect)")
+    parser.add_argument("--model-path", default=None,
+                        help="path to the .gguf model to serve (default: auto-detect)")
     parser.add_argument("--ngl", type=int, default=DEFAULT_NGL,
                         help="number of layers to offload to GPU")
     parser.add_argument("--ctx-size", type=int, default=0,
@@ -644,8 +742,17 @@ def main():
         if server_is_up(base_url):
             print(f"[llama-server already running at {base_url}, reusing it]")
         else:
+            try:
+                server_bin = resolve_server_bin(args.server_bin, args.backend)
+                model_path = resolve_model_path(args.model_path)
+            except RuntimeError as e:
+                print(f"\nError: {e}")
+                return
             log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.log")
-            proc = start_server(args.server_bin, args.model_path, args.host, args.port,
+            print(f"[backend] {args.backend}")
+            print(f"[server] {server_bin}")
+            print(f"[model] {model_path}")
+            proc = start_server(server_bin, model_path, args.host, args.port,
                                 args.ngl, args.ctx_size, args.server_arg, log_path)
             atexit.register(stop_server, proc)
             try:

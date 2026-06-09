@@ -7,11 +7,12 @@ Design goal: faster than Roo / Cline. Local models only do prompt processing at 
 ## Prerequisites
 
 1. Python 3.7+
-2. A built `llama-server` and a `.gguf` model. The agent **launches `llama-server` for you** on startup (and shuts it down on exit), so you no longer need to start it manually. The defaults point at:
-   - server: `C:\Users\bookery\llama.cpp\build-x64-windows-vulkan-release\bin\llama-server.exe`
-   - model: `C:\Users\bookery\llama.cpp\mymodels\gemma-4-12b-it-GGUF\gemma-4-12b-it-Q4_K_M.gguf`
+2. A built `llama-server` and a `.gguf` model. The agent **launches `llama-server` for you** on startup (and shuts it down on exit), so you no longer need to start it manually. By default it auto-detects:
+   - `llama-server` from a llama.cpp checkout such as `~/llama.cpp` or a sibling `llama.cpp` directory.
+   - backend build directories such as `build-vulkan`, `build-x64-windows-vulkan-release`, or `build-hip`.
+   - the model at `mymodels/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q4_K_M.gguf`, falling back to the first `.gguf` under `mymodels`.
 
-   Override either with `--server-bin` / `--model-path`. If a server is already running at the target URL, the agent detects it and reuses it instead of starting a new one. Use `--no-server` to skip launching entirely and connect to an existing server.
+   Select a backend with `--backend vulkan` or `--backend hip`; the default `--backend auto` tries Vulkan first, then HIP. Override paths with `--server-bin` / `--model-path`. If a server is already running at the target URL, the agent detects it and reuses it instead of starting a new one. Use `--no-server` to skip launching entirely and connect to an existing server.
 
 ## llama.cpp backend requirements
 
@@ -33,8 +34,8 @@ Build llama.cpp with Vulkan on Windows:
 
 ```powershell
 cd C:\Users\bookery\llama.cpp
-cmake -S . -B build-x64-windows-vulkan-release -DGGML_VULKAN=ON
-cmake --build build-x64-windows-vulkan-release --config Release --target llama-server llama-bench
+cmake -S . -B build-vulkan -DGGML_VULKAN=ON
+cmake --build build-vulkan --config Release --target llama-server llama-bench
 ```
 
 Build llama.cpp with Vulkan on Linux:
@@ -83,8 +84,9 @@ When you quit (empty line / Ctrl+C), the agent terminates the `llama-server` it 
 | `--no-server` | off | Do not launch llama-server; connect to an already-running one |
 | `--host` | `127.0.0.1` | llama-server host |
 | `--port` | `8080` | llama-server port |
-| `--server-bin` | (path above) | Path to the `llama-server` executable |
-| `--model-path` | (path above) | Path to the `.gguf` model to serve |
+| `--backend` | `auto` | Backend build to auto-detect: `auto`, `vulkan`, or `hip` |
+| `--server-bin` | auto-detect | Path to the `llama-server` executable |
+| `--model-path` | auto-detect | Path to the `.gguf` model to serve |
 | `--ngl` | `99` | Number of layers to offload to GPU |
 | `--ctx-size` | `0` | Context size (`-c`); `0` leaves the server default |
 | `--server-arg ARG` | none | Extra raw argument passed to llama-server (repeatable) |
@@ -94,6 +96,16 @@ Example (auto-confirm, limit to 10 steps):
 
 ```powershell
 python c:\Users\bookery\mini-agent\agent.py --yes --max-steps 10
+```
+
+Example (choose a backend build):
+
+```powershell
+python c:\Users\bookery\mini-agent\agent.py --backend vulkan
+```
+
+```bash
+python3 ~/mini-agent/agent.py --backend hip
 ```
 
 Example (serve a different model, pass extra server flags):
