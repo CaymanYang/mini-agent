@@ -37,6 +37,7 @@ BACKEND_BUILD_DIRS = {
     "vulkan": ["build-vulkan", "build-x64-windows-vulkan-release"],
     "hip": ["build-hip"],
 }
+TOKEN_STATUS_EVERY = 16
 
 SYSTEM_PROMPT = """You are a minimal coding agent. You solve the user's task by calling tools, one step at a time.
 
@@ -123,8 +124,6 @@ def find_llama_roots():
         os.path.join(os.path.dirname(script_dir), "llama.cpp"),
         os.path.join(home, "llama.cpp"),
     ]
-    if os.name == "nt":
-        candidates.append(r"C:\Users\bookery\llama.cpp")
     return _unique_existing_dirs(candidates)
 
 
@@ -206,6 +205,57 @@ def server_is_up(base_url, timeout=2.0):
         return False
 
 
+class TokenStats:
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.prompt = 0
+        self.completion = 0
+        self.total = 0
+        self.steps = 0
+
+    def add(self, usage):
+        if not self.enabled or not usage:
+            return
+        prompt = usage.get("prompt_tokens") or usage.get("prompt") or 0
+        completion = usage.get("completion_tokens") or usage.get("completion") or 0
+        total = usage.get("total_tokens") or usage.get("total") or prompt + completion
+        self.prompt += int(prompt)
+        self.completion += int(completion)
+        self.total += int(total)
+        self.steps += 1
+
+    def summary(self):
+        return f"prompt={self.prompt}, completion={self.completion}, total={self.total}"
+
+
+def tokenize_text(base_url, text, timeout=10.0):
+    """Return llama-server token count for text, or None if unavailable."""
+    url = _server_root(base_url) + "/tokenize"
+    payload = json.dumps({"content": text}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    tokens = body.get("tokens")
+    return len(tokens) if isinstance(tokens, list) else None
+
+
+def estimate_message_tokens(base_url, messages):
+    """Approximate context tokens by tokenizing message text without chat template."""
+    chunks = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if content:
+            chunks.append(f"{msg.get('role', 'user')}:\n{content}")
+    if not chunks:
+        return 0
+    return tokenize_text(base_url, "\n\n".join(chunks))
+
+
 def start_server(server_bin, model_path, host, port, ngl, ctx_size, extra_args, log_path):
     """Launch llama-server as a child process; return the Popen handle."""
     if not os.path.isfile(server_bin):
@@ -281,7 +331,7 @@ def stop_server(proc):
 
 
 def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=True,
-             stop_on_action=True, stall_timeout=180):
+             stop_on_action=True, stall_timeout=180, show_tokens=True):
     """Call /chat/completions. Streams tokens to stdout and returns the full assistant text."""
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
@@ -293,6 +343,8 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
         # which lets a reasoning model run for thousands of tokens and appear stuck.
         "max_tokens": max_tokens,
     }
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
     if not think:
         # This Gemma "thinking" model otherwise spends thousands of tokens in a
         # hidden reasoning_content stream (no visible output -> looks frozen).
@@ -313,7 +365,7 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
         text = choice["message"]["content"]
         print(text, end="", flush=True)
         print()
-        return text, choice.get("finish_reason")
+        return text, choice.get("finish_reason"), body.get("usage")
 
     # Read the HTTP stream in a background thread and hand lines to the main thread
     # via a queue. On Windows a blocking socket read does NOT let Python deliver
@@ -339,6 +391,10 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
     parts = []
     in_reasoning = False
     finish_reason = None
+    usage = None
+    streamed_tokens = 0
+    last_status_tokens = 0
+    token_status_printed = False
     last_data = time.time()
     try:
         while True:
@@ -368,7 +424,12 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
                 obj = json.loads(chunk)
             except json.JSONDecodeError:
                 continue
-            choice = obj.get("choices", [{}])[0]
+            if obj.get("usage"):
+                usage = obj["usage"]
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
             delta = choice.get("delta", {})
@@ -379,6 +440,7 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
                     print("[thinking] ", end="", flush=True)
                     in_reasoning = True
                 print(reasoning, end="", flush=True)
+                streamed_tokens += 1
             piece = delta.get("content")
             if piece:
                 if in_reasoning:
@@ -386,6 +448,13 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
                     in_reasoning = False
                 parts.append(piece)
                 print(piece, end="", flush=True)
+                streamed_tokens += 1
+            if (show_tokens and streamed_tokens and streamed_tokens % TOKEN_STATUS_EVERY == 0
+                    and streamed_tokens != last_status_tokens):
+                print(f"\r[tokens completion~{streamed_tokens}]", end="", file=sys.stderr, flush=True)
+                last_status_tokens = streamed_tokens
+                token_status_printed = True
+            if piece:
                 # Early stop: once a full ACTION is available, don't wait for the
                 # model to keep rambling (it often appends text up to max_tokens).
                 if stop_on_action and "}" in piece:
@@ -400,8 +469,12 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
             resp.close()
         except Exception:
             pass
+    if token_status_printed:
+        print(file=sys.stderr)
     print()
-    return "".join(parts), finish_reason
+    if usage is None and streamed_tokens:
+        usage = {"completion_tokens": streamed_tokens, "total_tokens": streamed_tokens, "estimated": True}
+    return "".join(parts), finish_reason, usage
 
 
 def list_dir(args):
@@ -595,17 +668,36 @@ def run_tool(action, auto_yes):
 
 
 def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens, think,
-               stall_timeout=180):
+               stall_timeout=180, show_tokens=True, token_stats=None):
     messages.append({"role": "user", "content": task})
+    token_stats = token_stats or TokenStats(enabled=show_tokens)
     repeats = 0
     last_signature = None
     empty_retried = False
     parse_fails = 0
     for step in range(1, max_steps + 1):
         print(f"\n=== step {step} ===")
-        reply, finish_reason = call_llm(base_url, model, messages,
-                                        max_tokens=max_tokens, think=think,
-                                        stall_timeout=stall_timeout)
+        prompt_est = estimate_message_tokens(base_url, messages) if show_tokens else None
+        if show_tokens and prompt_est is not None:
+            print(f"[tokens input~{prompt_est}; session {token_stats.summary()}]")
+        reply, finish_reason, usage = call_llm(base_url, model, messages,
+                                               max_tokens=max_tokens, think=think,
+                                               stall_timeout=stall_timeout,
+                                               show_tokens=show_tokens)
+        if show_tokens:
+            if usage:
+                if usage.get("estimated") and prompt_est is not None:
+                    usage["prompt_tokens"] = prompt_est
+                    usage["total_tokens"] = prompt_est + int(usage.get("completion_tokens", 0))
+                token_stats.add(usage)
+                approx = "~" if usage.get("estimated") else ""
+                prompt = usage.get("prompt_tokens", 0)
+                completion = usage.get("completion_tokens", 0)
+                total = usage.get("total_tokens", prompt + completion)
+                print(f"[tokens step {approx}prompt={prompt}, completion={completion}, total={total}; "
+                      f"session {token_stats.summary()}]")
+            elif prompt_est is not None:
+                print(f"[tokens step prompt~{prompt_est}; completion unavailable]")
 
         # The model occasionally returns an empty assistant turn; retry once before
         # giving up so a single stray empty reply does not silently drop the task.
@@ -704,7 +796,7 @@ def main():
                         help="skip confirmation before writing files / running commands")
     parser.add_argument("--max-steps", type=int, default=20,
                         help="max steps per task")
-    parser.add_argument("--max-tokens", type=int, default=4096,
+    parser.add_argument("--max-tokens", type=int, default=2048,
                         help="max tokens generated per step (auto-raised if an action is "
                              "truncated; prevents long unresponsive runs)")
     parser.add_argument("--think", action="store_true",
@@ -733,6 +825,10 @@ def main():
                         help="seconds to wait for the server to become ready")
     parser.add_argument("--stall-timeout", type=int, default=180,
                         help="abort a step if the model streams no output for this many seconds")
+    parser.add_argument("--tokens", dest="show_tokens", action="store_true", default=True,
+                        help="show live token estimates and per-step/session usage")
+    parser.add_argument("--no-tokens", dest="show_tokens", action="store_false",
+                        help="hide token usage output")
     args = parser.parse_args()
 
     base_url = args.base_url or f"http://{args.host}:{args.port}/v1"
@@ -778,6 +874,7 @@ def main():
         )
         print(f"[loaded conventions from {conv_path}]")
     messages = [{"role": "system", "content": system_content}]
+    token_stats = TokenStats(enabled=args.show_tokens)
     try:
         while True:
             try:
@@ -791,7 +888,9 @@ def main():
             try:
                 agent_loop(base_url, args.model, task, messages, args.yes,
                            args.max_steps, args.max_tokens, args.think,
-                           stall_timeout=args.stall_timeout)
+                           stall_timeout=args.stall_timeout,
+                           show_tokens=args.show_tokens,
+                           token_stats=token_stats)
             except RuntimeError as e:
                 print(f"\nError: {e}")
             except KeyboardInterrupt:

@@ -8,7 +8,7 @@ Design goal: faster than Roo / Cline. Local models only do prompt processing at 
 
 1. Python 3.7+
 2. A built `llama-server` and a `.gguf` model. The agent **launches `llama-server` for you** on startup (and shuts it down on exit), so you no longer need to start it manually. By default it auto-detects:
-   - `llama-server` from a llama.cpp checkout such as `~/llama.cpp` or a sibling `llama.cpp` directory.
+   - `llama-server` from the current directory, `LLAMA_CPP_DIR`, or a sibling `llama.cpp` checkout.
    - backend build directories such as `build-vulkan`, `build-x64-windows-vulkan-release`, or `build-hip`.
    - the model at `mymodels/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q4_K_M.gguf`, falling back to the first `.gguf` under `mymodels`.
 
@@ -33,7 +33,7 @@ Common requirements:
 Build llama.cpp with Vulkan on Windows:
 
 ```powershell
-cd C:\Users\bookery\llama.cpp
+cd llama.cpp
 cmake -S . -B build-vulkan -DGGML_VULKAN=ON
 cmake --build build-vulkan --config Release --target llama-server llama-bench
 ```
@@ -41,7 +41,7 @@ cmake --build build-vulkan --config Release --target llama-server llama-bench
 Build llama.cpp with Vulkan on Linux:
 
 ```bash
-cd /home/bookery/llama.cpp
+cd llama.cpp
 cmake -S . -B build-vulkan -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-vulkan --target llama-server llama-bench -- -j"$(nproc)"
 ```
@@ -49,7 +49,7 @@ cmake --build build-vulkan --target llama-server llama-bench -- -j"$(nproc)"
 Build llama.cpp with ROCm/HIP on Linux:
 
 ```bash
-cd /home/bookery/llama.cpp
+cd llama.cpp
 HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
 cmake -S . -B build-hip -DGGML_HIP=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-hip --target llama-server llama-bench -- -j"$(nproc)"
@@ -60,7 +60,7 @@ After building, pass the matching server path with `--server-bin`, or update the
 ## Usage
 
 ```powershell
-python c:\Users\bookery\mini-agent\agent.py
+python agent.py
 ```
 
 This starts `llama-server`, waits until its `/health` endpoint is ready, then drops you into the task prompt. The server's stdout/stderr is written to `mini-agent\server.log`. Enter a task (empty line to quit), for example:
@@ -91,33 +91,34 @@ When you quit (empty line / Ctrl+C), the agent terminates the `llama-server` it 
 | `--ctx-size` | `0` | Context size (`-c`); `0` leaves the server default |
 | `--server-arg ARG` | none | Extra raw argument passed to llama-server (repeatable) |
 | `--server-timeout` | `300` | Seconds to wait for the server to become ready |
+| `--tokens` / `--no-tokens` | on | Show or hide live token estimates and per-step/session usage |
 
 Example (auto-confirm, limit to 10 steps):
 
 ```powershell
-python c:\Users\bookery\mini-agent\agent.py --yes --max-steps 10
+python agent.py --yes --max-steps 10
 ```
 
 Example (choose a backend build):
 
 ```powershell
-python c:\Users\bookery\mini-agent\agent.py --backend vulkan
+python agent.py --backend vulkan
 ```
 
 ```bash
-python3 ~/mini-agent/agent.py --backend hip
+python3 agent.py --backend hip
 ```
 
 Example (serve a different model, pass extra server flags):
 
 ```powershell
-python c:\Users\bookery\mini-agent\agent.py --model-path C:\models\my.gguf --ctx-size 8192 --server-arg --flash-attn
+python agent.py --model-path models\my.gguf --ctx-size 8192 --server-arg --flash-attn
 ```
 
 Example (reuse a server you already started elsewhere):
 
 ```powershell
-python c:\Users\bookery\mini-agent\agent.py --no-server --base-url http://127.0.0.1:8080/v1
+python agent.py --no-server --base-url http://127.0.0.1:8080/v1
 ```
 
 ## Project conventions (memory)
