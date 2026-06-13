@@ -37,7 +37,11 @@ BACKEND_BUILD_DIRS = {
     "vulkan": ["build-vulkan", "build-x64-windows-vulkan-release"],
     "hip": ["build-hip"],
 }
-TOKEN_STATUS_EVERY = 16
+DEFAULT_CONTEXT_LIMIT = 8192
+DEFAULT_COMPACT_THRESHOLD = 0.70
+DEFAULT_COMPACT_KEEP_MESSAGES = 6
+DEFAULT_COMPACT_MAX_TOKENS = 1024
+DEFAULT_MEMORY_FILE = os.path.join(".mini-agent", "memory", "session.md")
 
 SYSTEM_PROMPT = """You are a minimal coding agent. You solve the user's task by calling tools, one step at a time.
 
@@ -256,6 +260,105 @@ def estimate_message_tokens(base_url, messages):
     return tokenize_text(base_url, "\n\n".join(chunks))
 
 
+def load_memory(memory_file):
+    if not memory_file:
+        return None
+    path = os.path.abspath(os.path.expanduser(memory_file))
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read().strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def save_memory(memory_file, text):
+    path = os.path.abspath(os.path.expanduser(memory_file))
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    memory_root = os.path.dirname(parent)
+    if os.path.basename(memory_root) == ".mini-agent":
+        ignore_path = os.path.join(memory_root, ".gitignore")
+        if not os.path.exists(ignore_path):
+            with open(ignore_path, "w", encoding="utf-8") as f:
+                f.write("*\n!.gitignore\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text.strip() + "\n")
+    return path
+
+
+def messages_to_transcript(messages):
+    chunks = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if content:
+            chunks.append(f"## {role}\n{content}")
+    return "\n\n".join(chunks)
+
+
+COMPACT_PROMPT = """Summarize this mini-agent session into concise long-term memory.
+
+Rules:
+- Only use facts from the transcript.
+- Do not invent files, commands, or decisions.
+- Preserve details needed to continue the task.
+- Keep it short but actionable.
+
+Write markdown with exactly these sections:
+# Session Summary
+
+## Goal
+
+## Current State
+
+## Important Decisions
+
+## Files Touched
+
+## Commands Run
+
+## Open Tasks
+
+## Constraints
+"""
+
+
+def compact_messages(base_url, model, messages, memory_file, keep_messages,
+                     max_tokens, think, stall_timeout):
+    """Summarize older history, save it, and replace it with a compact memory."""
+    if len(messages) <= keep_messages + 1:
+        return False
+    system_msg = messages[0]
+    recent = messages[-keep_messages:] if keep_messages > 0 else []
+    transcript = messages_to_transcript(messages[1:])
+    compact_request = [
+        {"role": "system", "content": COMPACT_PROMPT},
+        {"role": "user", "content": transcript},
+    ]
+    print(f"[auto-compact] summarizing history into {memory_file}")
+    summary, _, _ = call_llm(base_url, model, compact_request,
+                             max_tokens=max_tokens, think=think,
+                             stop_on_action=False,
+                             stall_timeout=stall_timeout,
+                             show_tokens=False)
+    summary = summary.strip()
+    if not summary:
+        print("[auto-compact] skipped: model returned empty summary")
+        return False
+    path = save_memory(memory_file, summary)
+    memory_msg = {
+        "role": "user",
+        "content": f"Compressed session memory loaded from {path}:\n\n{summary}",
+    }
+    messages[:] = [system_msg, memory_msg] + recent
+    print(f"[auto-compact] wrote {path}; kept last {len(recent)} messages")
+    return True
+
+
 def start_server(server_bin, model_path, host, port, ngl, ctx_size, extra_args, log_path):
     """Launch llama-server as a child process; return the Popen handle."""
     if not os.path.isfile(server_bin):
@@ -393,8 +496,6 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
     finish_reason = None
     usage = None
     streamed_tokens = 0
-    last_status_tokens = 0
-    token_status_printed = False
     last_data = time.time()
     try:
         while True:
@@ -449,11 +550,6 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
                 parts.append(piece)
                 print(piece, end="", flush=True)
                 streamed_tokens += 1
-            if (show_tokens and streamed_tokens and streamed_tokens % TOKEN_STATUS_EVERY == 0
-                    and streamed_tokens != last_status_tokens):
-                print(f"\r[tokens completion~{streamed_tokens}]", end="", file=sys.stderr, flush=True)
-                last_status_tokens = streamed_tokens
-                token_status_printed = True
             if piece:
                 # Early stop: once a full ACTION is available, don't wait for the
                 # model to keep rambling (it often appends text up to max_tokens).
@@ -469,8 +565,6 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
             resp.close()
         except Exception:
             pass
-    if token_status_printed:
-        print(file=sys.stderr)
     print()
     if usage is None and streamed_tokens:
         usage = {"completion_tokens": streamed_tokens, "total_tokens": streamed_tokens, "estimated": True}
@@ -667,8 +761,42 @@ def run_tool(action, auto_yes):
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+def _normalized_command(text):
+    return re.sub(r"\s+", "", text.strip().lower())
+
+
+def is_exit_command(text):
+    return _normalized_command(text) in {"exit()", "退出"}
+
+
+def is_end_session_command(text):
+    normalized = _normalized_command(text)
+    exact = {
+        "结束",
+        "结束任务",
+        "结束本次任务",
+        "结束当前任务",
+        "结束会话",
+        "结束本次会话",
+        "结束当前会话",
+        "结束session",
+        "结束当前session",
+        "结束本次session",
+    }
+    if normalized in exact:
+        return True
+    return (
+        "结束" in normalized
+        and any(marker in normalized for marker in ("任务", "会话", "session"))
+    )
+
+
 def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens, think,
-               stall_timeout=180, show_tokens=True, token_stats=None):
+               stall_timeout=180, show_tokens=True, token_stats=None,
+               auto_compact=True, compact_threshold=DEFAULT_COMPACT_THRESHOLD,
+               ctx_size=0, memory_file=DEFAULT_MEMORY_FILE,
+               compact_keep_messages=DEFAULT_COMPACT_KEEP_MESSAGES,
+               compact_max_tokens=DEFAULT_COMPACT_MAX_TOKENS):
     messages.append({"role": "user", "content": task})
     token_stats = token_stats or TokenStats(enabled=show_tokens)
     repeats = 0
@@ -677,7 +805,14 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
     parse_fails = 0
     for step in range(1, max_steps + 1):
         print(f"\n=== step {step} ===")
-        prompt_est = estimate_message_tokens(base_url, messages) if show_tokens else None
+        prompt_est = estimate_message_tokens(base_url, messages) if (show_tokens or auto_compact) else None
+        context_limit = ctx_size or DEFAULT_CONTEXT_LIMIT
+        if (auto_compact and prompt_est is not None
+                and prompt_est >= int(context_limit * compact_threshold)):
+            if compact_messages(base_url, model, messages, memory_file,
+                                compact_keep_messages, compact_max_tokens, think,
+                                stall_timeout):
+                prompt_est = estimate_message_tokens(base_url, messages)
         if show_tokens and prompt_est is not None:
             print(f"[tokens input~{prompt_est}; session {token_stats.summary()}]")
         reply, finish_reason, usage = call_llm(base_url, model, messages,
@@ -804,6 +939,8 @@ def main():
     parser.add_argument("--notes", default=None,
                         help="path to a project conventions file injected into the system prompt "
                              "(default: auto-detect AGENTS.md in the working directory)")
+    parser.add_argument("--work-dir", default=".",
+                        help="project root for tools, conventions, and .mini-agent memory")
     # llama-server lifecycle.
     parser.add_argument("--no-server", action="store_true",
                         help="do not launch llama-server; connect to an already-running one")
@@ -817,7 +954,7 @@ def main():
                         help="path to the .gguf model to serve (default: auto-detect)")
     parser.add_argument("--ngl", type=int, default=DEFAULT_NGL,
                         help="number of layers to offload to GPU")
-    parser.add_argument("--ctx-size", type=int, default=0,
+    parser.add_argument("--ctx-size", type=int, default=131072,
                         help="context size (-c); 0 leaves the server default")
     parser.add_argument("--server-arg", action="append", default=[], metavar="ARG",
                         help="extra raw argument passed to llama-server (repeatable)")
@@ -826,10 +963,32 @@ def main():
     parser.add_argument("--stall-timeout", type=int, default=180,
                         help="abort a step if the model streams no output for this many seconds")
     parser.add_argument("--tokens", dest="show_tokens", action="store_true", default=True,
-                        help="show live token estimates and per-step/session usage")
+                        help="show input token estimates and per-step/session usage")
     parser.add_argument("--no-tokens", dest="show_tokens", action="store_false",
                         help="hide token usage output")
+    parser.add_argument("--auto-compact", dest="auto_compact", action="store_true",
+                        default=True,
+                        help="summarize old history when context usage reaches the threshold")
+    parser.add_argument("--no-auto-compact", dest="auto_compact", action="store_false",
+                        help="disable automatic long-memory compaction")
+    parser.add_argument("--compact-threshold", type=float,
+                        default=DEFAULT_COMPACT_THRESHOLD,
+                        help="context usage ratio that triggers compaction")
+    parser.add_argument("--compact-keep-messages", type=int,
+                        default=DEFAULT_COMPACT_KEEP_MESSAGES,
+                        help="recent messages to keep verbatim after compaction")
+    parser.add_argument("--compact-max-tokens", type=int,
+                        default=DEFAULT_COMPACT_MAX_TOKENS,
+                        help="max tokens generated for the compaction summary")
+    parser.add_argument("--memory-file", default=DEFAULT_MEMORY_FILE,
+                        help="markdown file used for compressed session memory")
     args = parser.parse_args()
+
+    work_dir = os.path.abspath(os.path.expanduser(args.work_dir))
+    if not os.path.isdir(work_dir):
+        print(f"\nError: work directory not found: {work_dir}")
+        return
+    os.chdir(work_dir)
 
     base_url = args.base_url or f"http://{args.host}:{args.port}/v1"
 
@@ -863,17 +1022,31 @@ def main():
                   "start one or drop --no-server")
 
     print(f"mini-agent -> {base_url} (model={args.model})")
-    print("Enter a task and press Enter; empty line or Ctrl+C to quit.\n")
+    print(f"[work dir] {os.getcwd()}")
+    print('Enter a task and press Enter; use exit() or "退出" to quit.\n')
 
-    system_content = f"{SYSTEM_PROMPT}\n\nWorking directory: {os.getcwd()}\nAll relative paths resolve against this directory."
+    base_system_content = f"{SYSTEM_PROMPT}\n\nWorking directory: {os.getcwd()}\nAll relative paths resolve against this directory."
     conv_path, conv_text = load_conventions(args.notes)
     if conv_text:
-        system_content += (
+        base_system_content += (
             f"\n\nProject conventions (from {os.path.basename(conv_path)}; "
             f"follow these strictly):\n{conv_text}"
         )
         print(f"[loaded conventions from {conv_path}]")
-    messages = [{"role": "system", "content": system_content}]
+
+    def new_session_messages(print_loaded=False):
+        system_content = base_system_content
+        memory_text = load_memory(args.memory_file) if args.auto_compact else None
+        if memory_text:
+            system_content += (
+                f"\n\nPersistent session memory (from {args.memory_file}; use it as "
+                f"compressed prior context):\n{memory_text}"
+            )
+            if print_loaded:
+                print(f"[loaded memory from {args.memory_file}]")
+        return [{"role": "system", "content": system_content}]
+
+    messages = new_session_messages(print_loaded=True)
     token_stats = TokenStats(enabled=args.show_tokens)
     try:
         while True:
@@ -883,14 +1056,36 @@ def main():
                 print("\nbye")
                 break
             if not task:
+                continue
+            if is_exit_command(task):
                 print("bye")
                 break
+            if is_end_session_command(task):
+                if len(messages) > 1 and args.auto_compact:
+                    try:
+                        compact_messages(base_url, args.model, messages, args.memory_file,
+                                         keep_messages=0,
+                                         max_tokens=args.compact_max_tokens,
+                                         think=args.think,
+                                         stall_timeout=args.stall_timeout)
+                    except RuntimeError as e:
+                        print(f"[session memory save failed: {e}]")
+                messages = new_session_messages(print_loaded=True)
+                token_stats = TokenStats(enabled=args.show_tokens)
+                print("[session ended; waiting for a new task]")
+                continue
             try:
                 agent_loop(base_url, args.model, task, messages, args.yes,
                            args.max_steps, args.max_tokens, args.think,
                            stall_timeout=args.stall_timeout,
                            show_tokens=args.show_tokens,
-                           token_stats=token_stats)
+                           token_stats=token_stats,
+                           auto_compact=args.auto_compact,
+                           compact_threshold=args.compact_threshold,
+                           ctx_size=args.ctx_size,
+                           memory_file=args.memory_file,
+                           compact_keep_messages=args.compact_keep_messages,
+                           compact_max_tokens=args.compact_max_tokens)
             except RuntimeError as e:
                 print(f"\nError: {e}")
             except KeyboardInterrupt:

@@ -63,13 +63,13 @@ After building, pass the matching server path with `--server-bin`, or update the
 python agent.py
 ```
 
-This starts `llama-server`, waits until its `/health` endpoint is ready, then drops you into the task prompt. The server's stdout/stderr is written to `mini-agent\server.log`. Enter a task (empty line to quit), for example:
+This starts `llama-server`, waits until its `/health` endpoint is ready, then drops you into the task prompt. The server's stdout/stderr is written to `mini-agent\server.log`. Enter a task, for example:
 
 ```
 task> Read llama.cpp/src/models/gemma4.cpp and summarize its structure
 ```
 
-When you quit (empty line / Ctrl+C), the agent terminates the `llama-server` it started.
+Use `exit()` or `退出` to quit the agent program. Use `结束任务` or similar wording to end the current session, save compressed memory if enabled, and wait for a new task. Empty input is ignored.
 
 ## Options
 
@@ -81,6 +81,7 @@ When you quit (empty line / Ctrl+C), the agent terminates the `llama-server` it 
 | `--max-steps` | `20` | Max ReAct steps per task |
 | `--max-tokens` | `2048` | Max tokens generated per step (prevents long unresponsive runs) |
 | `--think` | off | Enable model reasoning/thinking; disabled by default to avoid stalls |
+| `--work-dir` | `.` | Project root for tools, conventions, and `.mini-agent` memory |
 | `--no-server` | off | Do not launch llama-server; connect to an already-running one |
 | `--host` | `127.0.0.1` | llama-server host |
 | `--port` | `8080` | llama-server port |
@@ -91,7 +92,12 @@ When you quit (empty line / Ctrl+C), the agent terminates the `llama-server` it 
 | `--ctx-size` | `0` | Context size (`-c`); `0` leaves the server default |
 | `--server-arg ARG` | none | Extra raw argument passed to llama-server (repeatable) |
 | `--server-timeout` | `300` | Seconds to wait for the server to become ready |
-| `--tokens` / `--no-tokens` | on | Show or hide live token estimates and per-step/session usage |
+| `--tokens` / `--no-tokens` | on | Show or hide input token estimates and per-step/session usage |
+| `--auto-compact` / `--no-auto-compact` | on | Summarize old history when context usage reaches the threshold |
+| `--compact-threshold` | `0.70` | Context usage ratio that triggers compaction |
+| `--compact-keep-messages` | `6` | Recent messages kept verbatim after compaction |
+| `--compact-max-tokens` | `1024` | Max tokens generated for the compaction summary |
+| `--memory-file` | `.mini-agent/memory/session.md` | Markdown file used for compressed session memory |
 
 Example (auto-confirm, limit to 10 steps):
 
@@ -109,6 +115,12 @@ python agent.py --backend vulkan
 python3 agent.py --backend hip
 ```
 
+Example (run the agent from its source directory, but work on another project):
+
+```bash
+python3 /path/to/mini-agent/agent.py --work-dir /path/to/llama.cpp --backend hip
+```
+
 Example (serve a different model, pass extra server flags):
 
 ```powershell
@@ -123,12 +135,26 @@ python agent.py --no-server --base-url http://127.0.0.1:8080/v1
 
 ## Project conventions (memory)
 
-The agent has no long-term memory, so to give it persistent project rules (e.g. "always run the program via `make run`", "compile HIP with `--offload-arch=gfx1150`"), put them in an `AGENTS.md` file in the working directory. On startup the agent auto-loads it and injects it into the system prompt.
+For persistent project rules (e.g. "always run the program via `make run`", "compile HIP with `--offload-arch=gfx1150`"), put them in an `AGENTS.md` file in the working directory. On startup the agent auto-loads it and injects it into the system prompt.
 
 - Auto-detected filenames (first match wins): `AGENTS.md`, `AGENT.md`, `.agentrc`, `conventions.md`.
 - Override the path with `--notes path\to\file.md`.
 
 This is how you stop the agent from, e.g., invoking `./hip_gemm.exe` directly when you want `make run`.
+
+## Long-memory compaction
+
+The agent keeps the live chat history for prompt-cache reuse, but it now has a minimal long-memory path for longer tasks. When the estimated input context reaches `--compact-threshold` (default `0.70`) of `--ctx-size`, it asks the local model to summarize the older conversation, writes the summary to `.mini-agent/memory/session.md`, then rebuilds history as:
+
+```text
+system prompt + compressed session memory + last 6 messages
+```
+
+If `--ctx-size` is `0`, compaction uses an 8192-token fallback limit for the threshold check. Pass the actual server context with `--ctx-size` for better timing.
+
+The memory file is loaded automatically on the next startup, so a later session can continue from the compressed task state. Disable this behavior with `--no-auto-compact`.
+
+Memory is relative to `--work-dir`, not the agent source directory. For example, if you work on `llama.cpp` with `--work-dir /path/to/llama.cpp`, the task memory lives under `/path/to/llama.cpp/.mini-agent/`. The agent source directory can keep its own `.mini-agent` only for tasks about the agent itself.
 
 ## Tools
 
