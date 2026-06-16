@@ -71,6 +71,8 @@ task> Read llama.cpp/src/models/gemma4.cpp and summarize its structure
 
 Use `exit()` or `退出` to quit the agent program. Use `结束任务` or similar wording to end the current session, save compressed memory if enabled, and wait for a new task. Empty input is ignored.
 
+The agent can call `open_file` to open a file for you. If the `code` command is available it opens the file non-blocking in VS Code/Cursor; otherwise it prints a `vim` command to run manually.
+
 ## Options
 
 | Option | Default | Description |

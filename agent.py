@@ -45,6 +45,7 @@ DEFAULT_COMPACT_THRESHOLD = 0.70
 DEFAULT_COMPACT_KEEP_MESSAGES = 6
 DEFAULT_COMPACT_MAX_TOKENS = 1024
 DEFAULT_MEMORY_FILE = os.path.join(".mini-agent", "memory", "session.md")
+THINKING_HEARTBEAT_SECONDS = 5
 
 SYSTEM_PROMPT = """You are a minimal coding agent. Solve the user's task one tool call at a time.
 
@@ -57,13 +58,14 @@ Tools:
 - read_file: {"path": str}
 - str_replace: {"path": str, "old_string": str, "new_string": str}
 - write_file: {"path": str, "content": str, "overwrite": bool optional}
+- open_file: {"path": str, "line": int optional}
 - run_shell: {"command": str}
 - mcp_call: {"server": str, "tool": str, "args": object optional}
 - finish: {"answer": str}
 
 Rules:
 - Emit one ACTION JSON only; never use native tool_call or OpenAI tool_calls syntax.
-- Put all tool parameters inside args.
+- Put all tool parameters inside args, including "overwrite": true.
 - JSON must be valid; escape newlines in strings.
 - Use relative paths; list_dir/read_file before guessing.
 - Edit existing files with str_replace only: copy an exact unique old_string from read_file output, without line numbers.
@@ -472,6 +474,29 @@ def stop_server(proc):
                 pass
 
 
+def _reasoning_text(delta_or_message):
+    texts = []
+    for key in ("reasoning_content", "reasoning", "thinking", "thought", "reasoning_text"):
+        value = delta_or_message.get(key)
+        if isinstance(value, str):
+            texts.append(value)
+        elif isinstance(value, dict):
+            for subkey in ("content", "text", "summary"):
+                subvalue = value.get(subkey)
+                if isinstance(subvalue, str):
+                    texts.append(subvalue)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    texts.append(item)
+                elif isinstance(item, dict):
+                    for subkey in ("content", "text", "summary"):
+                        subvalue = item.get(subkey)
+                        if isinstance(subvalue, str):
+                            texts.append(subvalue)
+    return "".join(texts)
+
+
 def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=True,
              stop_on_action=True, stall_timeout=180, show_tokens=True):
     """Call /chat/completions. Streams tokens to stdout and returns the full assistant text."""
@@ -507,6 +532,9 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
         message = choice["message"]
         action = _action_from_tool_calls(message.get("tool_calls") or [])
         text = _format_action_text(action) if action else (message.get("content") or "")
+        reasoning = _reasoning_text(message)
+        if think and reasoning:
+            print(f"[thinking] {reasoning}")
         print(text, end="", flush=True)
         print()
         return text, choice.get("finish_reason"), body.get("usage")
@@ -538,8 +566,10 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
     usage = None
     streamed_tokens = 0
     last_data = time.time()
+    last_visible = time.time()
     tool_calls = {}
     printed_tool_call = False
+    printed_waiting = False
     try:
         while True:
             try:
@@ -552,6 +582,13 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
                     raise RuntimeError(
                         f"no output from the model for {stall_timeout}s "
                         "(server may be stalled or busy; try restarting it)")
+                if think and time.time() - last_visible > THINKING_HEARTBEAT_SECONDS:
+                    if in_reasoning:
+                        print(" ...", end="", flush=True)
+                    else:
+                        print("[thinking...] ", end="", flush=True)
+                        printed_waiting = True
+                    last_visible = time.time()
                 continue  # also gives the main thread a chance to see Ctrl+C
             last_data = time.time()
             if raw is None:
@@ -583,8 +620,12 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
                     print("\n", end="", flush=True)
                     in_reasoning = False
                 if not printed_tool_call:
+                    if printed_waiting:
+                        print("\n", end="", flush=True)
+                        printed_waiting = False
                     print("[tool_call]", end="", flush=True)
                     printed_tool_call = True
+                    last_visible = time.time()
                 streamed_tokens += 1
                 for delta_call in delta_tool_calls:
                     idx = delta_call.get("index", 0)
@@ -600,21 +641,29 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
                     if function.get("arguments"):
                         target["arguments"] += function["arguments"]
             # Reasoning tokens arrive separately; show them so output never looks frozen.
-            reasoning = delta.get("reasoning_content")
+            reasoning = _reasoning_text(delta)
             if reasoning:
+                if printed_waiting:
+                    print("\n", end="", flush=True)
+                    printed_waiting = False
                 if not in_reasoning:
                     print("[thinking] ", end="", flush=True)
                     in_reasoning = True
                 print(reasoning, end="", flush=True)
                 streamed_tokens += 1
+                last_visible = time.time()
             piece = delta.get("content")
             if piece:
+                if printed_waiting:
+                    print("\n", end="", flush=True)
+                    printed_waiting = False
                 if in_reasoning:
                     print("\n", end="", flush=True)
                     in_reasoning = False
                 parts.append(piece)
                 print(piece, end="", flush=True)
                 streamed_tokens += 1
+                last_visible = time.time()
             if piece:
                 # Early stop: once a full ACTION is available, don't wait for the
                 # model to keep rambling (it often appends text up to max_tokens).
@@ -668,6 +717,37 @@ def read_file(args):
     return numbered + truncated
 
 
+def open_file(args):
+    path = args["path"]
+    line = args.get("line")
+    if not os.path.exists(path):
+        return f"ERROR: file not found: {path}"
+
+    abs_path = os.path.abspath(path)
+    try:
+        line = int(line) if line is not None else None
+    except (TypeError, ValueError):
+        line = None
+
+    code_bin = shutil.which("code")
+    if code_bin:
+        target = f"{abs_path}:{line}" if line and line > 0 else abs_path
+        try:
+            subprocess.Popen(
+                [code_bin, "-g", target],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return f"OK: opened {target}"
+        except OSError as e:
+            return f"ERROR: failed to open editor: {e}"
+
+    if line and line > 0:
+        return f"Open manually: vim +{line} {shlex.quote(abs_path)}"
+    return f"Open manually: vim {shlex.quote(abs_path)}"
+
+
 def write_file(args, auto_yes):
     path = args["path"]
     content = args.get("content", "")
@@ -675,7 +755,7 @@ def write_file(args, auto_yes):
         # Steer the model toward editing instead of rewriting existing files.
         return (f"ERROR: {path} already exists. To EDIT an existing file use "
                 "str_replace. To replace the entire file anyway, pass "
-                '"overwrite": true.')
+                'valid JSON args with "overwrite": true.')
     print(f"\n--- about to write file: {path} ({len(content)} chars) ---")
     if not auto_yes and not _confirm():
         return "SKIPPED: user declined write_file"
@@ -1116,7 +1196,7 @@ def _loose_string_value(text, key):
 
 
 def _loose_bool_value(text, key):
-    match = re.search(rf'"{re.escape(key)}"\s*:\s*(true|false)', text, re.IGNORECASE)
+    match = re.search(rf'"?{re.escape(key)}"?\s*:\s*(true|false)', text, re.IGNORECASE)
     if not match:
         return None
     return match.group(1).lower() == "true"
@@ -1237,6 +1317,8 @@ def run_tool(action, auto_yes, mcp_manager=None):
             return list_dir(args)
         if tool == "read_file":
             return read_file(args)
+        if tool == "open_file":
+            return open_file(args)
         if tool == "write_file":
             return write_file(args, auto_yes)
         if tool == "str_replace":
