@@ -183,8 +183,9 @@ Memory is relative to `--work-dir`, not the agent source directory. For example,
 
 - `list_dir {path?}`: list directory contents (default: current directory), helps locate files via relative paths
 - `read_file {path}`: read a file (with line numbers, truncated if too long)
-- `write_file {path, content}`: create / overwrite a whole file (confirmation required by default)
+- `write_file {path, content, overwrite?}`: create a new file, or overwrite only with `overwrite: true` (confirmation required by default)
 - `str_replace {path, old_string, new_string}`: local replacement in an existing file (must match uniquely, confirmation required by default); prefer this for small edits to avoid rewriting the whole file
+- `open_file {path, line?}`: open a file in VS Code/Cursor if `code` is available, otherwise print a manual `vim` command
 - `run_shell {command}`: run a command (PowerShell on Windows, confirmation required by default, 120s timeout)
 - `mcp_call {server, tool, args?}`: call a configured MCP tool
 - `finish {answer}`: end and give the final answer

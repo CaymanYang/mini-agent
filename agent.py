@@ -70,6 +70,7 @@ Rules:
 - Use relative paths; list_dir/read_file before guessing.
 - Edit existing files with str_replace only: copy an exact unique old_string from read_file output, without line numbers.
 - Use write_file only for new files.
+- For git commits, write a concise message about behavior changed, not file names.
 - After each OBSERVATION, decide the next ACTION. When done, call finish."""
 
 
@@ -873,6 +874,8 @@ def _windows_shell():
 def run_shell(args, auto_yes):
     command = args["command"]
     print(f"\n--- about to run command: {command} ---")
+    if re.search(r"\bgit\s+commit\b", command):
+        print("[commit message] Prefer a concise behavior summary, not just file names.")
     if not auto_yes and not _confirm():
         return "SKIPPED: user declined run_shell"
     is_windows = os.name == "nt"
