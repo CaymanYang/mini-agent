@@ -44,39 +44,28 @@ DEFAULT_COMPACT_KEEP_MESSAGES = 6
 DEFAULT_COMPACT_MAX_TOKENS = 1024
 DEFAULT_MEMORY_FILE = os.path.join(".mini-agent", "memory", "session.md")
 
-SYSTEM_PROMPT = """You are a minimal coding agent. You solve the user's task by calling tools, one step at a time.
+SYSTEM_PROMPT = """You are a minimal coding agent. Solve the user's task one tool call at a time.
 
-To call a tool, output a line containing exactly ACTION, then a single JSON object on the following lines:
+Output exactly:
 ACTION
 {"tool": "<name>", "args": { ... }}
 
-Available tools:
-- list_dir: {"path": str (optional, default ".")}  -> list files/dirs at a path
-- read_file: {"path": str}  -> returns file content with line numbers
-- str_replace: {"path": str, "old_string": str, "new_string": str}  -> EDIT an existing file by replacing one exact, unique snippet
-- write_file: {"path": str, "content": str, "overwrite": bool (optional)}  -> create a NEW file; refuses to overwrite an existing file unless overwrite=true
-- run_shell: {"command": str}  -> runs a shell command, returns stdout/stderr/exit code
-- mcp_call: {"server": str, "tool": str, "args": object (optional)}  -> call a configured MCP tool
-- finish: {"answer": str}  -> end the task and give the final answer to the user
-
-Editing files (IMPORTANT):
-- To change an EXISTING file you MUST use str_replace, never write_file. write_file is only for creating a brand-new file.
-- Workflow: read_file first, then str_replace with old_string copied EXACTLY from that file content (drop the "   N|" line-number prefix), including enough surrounding lines to be unique.
-- Make several small str_replace edits instead of rewriting the whole file.
-
-Example of editing an existing file:
-ACTION
-{"tool": "read_file", "args": {"path": "main.c"}}
-(observation shows: "    10|    int n = 5;")
-ACTION
-{"tool": "str_replace", "args": {"path": "main.c", "old_string": "    int n = 5;", "new_string": "    int n = 10;"}}
+Tools:
+- list_dir: {"path": str optional}
+- read_file: {"path": str}
+- str_replace: {"path": str, "old_string": str, "new_string": str}
+- write_file: {"path": str, "content": str, "overwrite": bool optional}
+- run_shell: {"command": str}
+- mcp_call: {"server": str, "tool": str, "args": object optional}
+- finish: {"answer": str}
 
 Rules:
-- Emit exactly ONE ACTION per reply. Do not emit more than one JSON object.
-- The JSON must be valid. Put file contents inside the string values (escape newlines as \\n).
-- Relative paths resolve against the working directory shown below; you usually do not need absolute paths. Use list_dir to discover files.
-- After each ACTION you will receive an OBSERVATION with the result. Use it to decide the next step.
-- Keep reasoning brief. When the task is done, call finish."""
+- Emit one ACTION JSON only; never use native tool_call or OpenAI tool_calls syntax.
+- JSON must be valid; escape newlines in strings.
+- Use relative paths; list_dir/read_file before guessing.
+- Edit existing files with str_replace only: copy an exact unique old_string from read_file output, without line numbers.
+- Use write_file only for new files.
+- After each OBSERVATION, decide the next ACTION. When done, call finish."""
 
 
 CONVENTION_FILENAMES = ["AGENTS.md", "AGENT.md", ".agentrc", "conventions.md"]
@@ -467,7 +456,9 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
     if not stream:
         body = json.loads(resp.read().decode("utf-8"))
         choice = body["choices"][0]
-        text = choice["message"]["content"]
+        message = choice["message"]
+        action = _action_from_tool_calls(message.get("tool_calls") or [])
+        text = _format_action_text(action) if action else (message.get("content") or "")
         print(text, end="", flush=True)
         print()
         return text, choice.get("finish_reason"), body.get("usage")
@@ -499,6 +490,8 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
     usage = None
     streamed_tokens = 0
     last_data = time.time()
+    tool_calls = {}
+    printed_tool_call = False
     try:
         while True:
             try:
@@ -536,6 +529,28 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
             delta = choice.get("delta", {})
+            delta_tool_calls = delta.get("tool_calls") or []
+            if delta_tool_calls:
+                if in_reasoning:
+                    print("\n", end="", flush=True)
+                    in_reasoning = False
+                if not printed_tool_call:
+                    print("[tool_call]", end="", flush=True)
+                    printed_tool_call = True
+                streamed_tokens += 1
+                for delta_call in delta_tool_calls:
+                    idx = delta_call.get("index", 0)
+                    call = tool_calls.setdefault(idx, {"function": {"name": "", "arguments": ""}})
+                    if delta_call.get("id"):
+                        call["id"] = delta_call["id"]
+                    if delta_call.get("type"):
+                        call["type"] = delta_call["type"]
+                    function = delta_call.get("function") or {}
+                    target = call.setdefault("function", {"name": "", "arguments": ""})
+                    if function.get("name"):
+                        target["name"] += function["name"]
+                    if function.get("arguments"):
+                        target["arguments"] += function["arguments"]
             # Reasoning tokens arrive separately; show them so output never looks frozen.
             reasoning = delta.get("reasoning_content")
             if reasoning:
@@ -570,6 +585,10 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
     print()
     if usage is None and streamed_tokens:
         usage = {"completion_tokens": streamed_tokens, "total_tokens": streamed_tokens, "estimated": True}
+    if not parts and tool_calls:
+        action = _action_from_tool_calls([tool_calls[i] for i in sorted(tool_calls)])
+        if action:
+            return _format_action_text(action), finish_reason, usage
     return "".join(parts), finish_reason, usage
 
 
@@ -840,8 +859,122 @@ def _confirm():
     return ans in ("y", "yes")
 
 
+def _json_loads_relaxed(candidate):
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        pass
+
+    # Models frequently emit raw Windows paths like ".\WorkDir\app.exe".
+    # Backslashes such as \W or \h are invalid JSON escapes, so escape any
+    # backslash that isn't part of a valid escape and try once more.
+    escaped = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", candidate)
+    try:
+        return json.loads(escaped)
+    except json.JSONDecodeError:
+        pass
+
+    # Gemma-style text sometimes uses JavaScript-like object keys.
+    quoted_keys = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)', r'\1"\2"\3', escaped)
+    try:
+        return json.loads(quoted_keys)
+    except json.JSONDecodeError:
+        return None
+
+
+def _normalize_action_object(obj):
+    if not isinstance(obj, dict):
+        return None
+
+    if "tool" in obj:
+        args = obj.get("args")
+        if not isinstance(args, dict):
+            # Some models flatten args to the top level instead of nesting them
+            # under "args" (e.g. {"tool":"run_shell","command":"ls"}). Accept that.
+            args = {k: v for k, v in obj.items() if k != "tool"}
+        obj["args"] = args
+        return obj
+
+    name = obj.get("name") or obj.get("function")
+    if isinstance(name, dict):
+        name = name.get("name")
+    if not isinstance(name, str):
+        return None
+
+    args = obj.get("args", obj.get("arguments", {}))
+    if isinstance(args, str):
+        args = _json_loads_relaxed(args) or {}
+    if not isinstance(args, dict):
+        args = {}
+
+    return _action_from_tool_name(name, args)
+
+
+def _action_from_tool_name(name, args):
+    if "." in name and name not in {"list_dir", "read_file", "str_replace", "write_file", "run_shell", "mcp_call", "finish"}:
+        server, tool = name.split(".", 1)
+        return {"tool": "mcp_call", "args": {"server": server, "tool": tool, "args": args}}
+    return {"tool": name, "args": args}
+
+
+def _action_from_tool_calls(tool_calls):
+    if not tool_calls:
+        return None
+    call = tool_calls[0]
+    function = call.get("function") or {}
+    name = function.get("name") or call.get("name")
+    if not name:
+        return None
+    args = function.get("arguments", call.get("arguments", {}))
+    if isinstance(args, str):
+        args = _json_loads_relaxed(args) or {}
+    if not isinstance(args, dict):
+        args = {}
+    return _action_from_tool_name(name, args)
+
+
+def _format_action_text(action):
+    return "ACTION\n" + json.dumps(action, ensure_ascii=False)
+
+
+def _parse_gemma_tool_call(text):
+    match = re.search(r"<\|tool_call\>(.*?)<tool_call\|>", text, re.DOTALL)
+    if not match:
+        return None
+
+    body = match.group(1).strip()
+    if body.startswith("call:"):
+        body = body[len("call:"):].strip()
+    if body.startswith("tool:"):
+        body = body[len("tool:"):].strip()
+
+    brace = body.find("{")
+    if brace == -1:
+        return None
+
+    name = body[:brace].strip(" \t\r\n:") or None
+    candidate = _extract_balanced(body[brace:])
+    if candidate is None:
+        return None
+
+    obj = _json_loads_relaxed(candidate)
+    if obj is None:
+        return None
+
+    action = _normalize_action_object(obj)
+    if action:
+        return action
+    if name:
+        return _action_from_tool_name(name, obj if isinstance(obj, dict) else {})
+    return None
+
+
 def parse_action(text):
     """Extract the JSON action object following an ACTION marker (or the first JSON object)."""
+    gemma_action = _parse_gemma_tool_call(text)
+    if gemma_action:
+        return gemma_action
+
     idx = text.find("ACTION")
     search_from = idx + len("ACTION") if idx != -1 else 0
     snippet = text[search_from:]
@@ -858,25 +991,8 @@ def parse_action(text):
         if candidate is None:
             return None
 
-    try:
-        obj = json.loads(candidate)
-    except json.JSONDecodeError:
-        # Models frequently emit raw Windows paths like ".\WorkDir\app.exe".
-        # Backslashes such as \W or \h are invalid JSON escapes, so escape any
-        # backslash that isn't part of a valid escape and try once more.
-        try:
-            obj = json.loads(re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", candidate))
-        except json.JSONDecodeError:
-            return None
-    if isinstance(obj, dict) and "tool" in obj:
-        args = obj.get("args")
-        if not isinstance(args, dict):
-            # Some models flatten args to the top level instead of nesting them
-            # under "args" (e.g. {"tool":"run_shell","command":"ls"}). Accept that.
-            args = {k: v for k, v in obj.items() if k != "tool"}
-        obj["args"] = args
-        return obj
-    return None
+    obj = _json_loads_relaxed(candidate)
+    return _normalize_action_object(obj)
 
 
 def _extract_balanced(s):
