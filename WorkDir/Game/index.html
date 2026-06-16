@@ -25,6 +25,7 @@
 </head>
 <body>
   <button id="startBtn">Start Game</button>
+  <div id="scoreBoard">Score: 0</div>
   <canvas id="gameCanvas" width="400" height="400"></canvas>
 <script>
   const canvas = document.getElementById('gameCanvas');
@@ -40,6 +41,7 @@
   let nextDirection = '';
   let gameRunning = false;
   let gameLoop;
+  let score = 0;
 
   function draw() {
     if (!gameRunning) return;
@@ -89,6 +91,8 @@
 
     if (newHead[0] === food.x && newHead[1] === food.y) {
       // Food eaten: length increases (don't pop), spawn new food
+      score += 10;
+      document.getElementById('scoreBoard').innerText = 'Score: ' + score;
       food = { 
         x: Math.floor(Math.random() * gridCount), 
         y: Math.floor(Math.random() * gridCount) 
@@ -110,7 +114,7 @@
   function gameOver() {
     gameRunning = false;
     clearTimeout(gameLoop);
-    alert('Game Over!');
+    alert('Game Over! Score: ' + score);
     resetGame();
   }
 
@@ -120,6 +124,8 @@
     dy = 0;
     nextDirection = '';
     food = { x: 5, y: 5 };
+    score = 0;
+    document.getElementById('scoreBoard').innerText = 'Score: 0';
     ctx.clearRect(0, 0, canvas.width, canvas.height);
   }
 

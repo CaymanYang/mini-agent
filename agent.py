@@ -70,7 +70,11 @@ Rules:
 - Use relative paths; list_dir/read_file before guessing.
 - Edit existing files with str_replace only: copy an exact unique old_string from read_file output, without line numbers.
 - Use write_file only for new files.
+- If the user asks to open a file, call open_file.
+- If the user asks about git status/diff/log, call run_shell with the git command.
+- If the user asks to commit or push, call run_shell with git after confirming intent.
 - For git commits, write a concise message about behavior changed, not file names.
+- Do not claim files were changed unless the latest OBSERVATION says OK.
 - After each OBSERVATION, decide the next ACTION. When done, call finish."""
 
 
@@ -765,7 +769,15 @@ def write_file(args, auto_yes):
         os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
-    return f"OK: wrote {len(content)} chars to {path}"
+    abs_path = os.path.abspath(path)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        written = f.read()
+    verified = written == content
+    size = os.path.getsize(path)
+    if not verified:
+        return f"ERROR: write_file verification failed for {abs_path}"
+    return (f"OK: write_file succeeded; verified=true; path={abs_path}; "
+            f"chars={len(content)}; bytes={size}")
 
 
 def _strip_read_file_line_numbers(text):
@@ -860,9 +872,16 @@ def str_replace(args, auto_yes):
     print(f"\n--- about to edit file: {path} (1 replacement, {len(matched_old)}->{len(new)} chars) ---")
     if not auto_yes and not _confirm():
         return "SKIPPED: user declined str_replace"
+    updated = content.replace(matched_old, new)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(content.replace(matched_old, new))
-    return f"OK: replaced 1 occurrence in {path}"
+        f.write(updated)
+    abs_path = os.path.abspath(path)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        written = f.read()
+    if written != updated:
+        return f"ERROR: str_replace verification failed for {abs_path}"
+    return (f"OK: str_replace succeeded; verified=true; path={abs_path}; "
+            f"replacements=1; chars={len(written)}")
 
 
 def _windows_shell():
@@ -1372,6 +1391,46 @@ def is_end_session_command(text):
     )
 
 
+def _looks_like_unverified_completion(reply):
+    lowered = reply.lower()
+    markers = (
+        "i have updated",
+        "i updated",
+        "i have modified",
+        "i modified",
+        "i have fixed",
+        "i fixed",
+        "changes have been made",
+        "file has been opened",
+        "已修改",
+        "改好了",
+        "已经修改",
+        "已经更新",
+        "已经完成",
+        "已完成",
+    )
+    file_words = (
+        "file",
+        "index.html",
+        ".py",
+        ".js",
+        ".html",
+        ".css",
+        "文件",
+        "代码",
+        "修改",
+    )
+    return any(marker in lowered for marker in markers) and any(word in lowered for word in file_words)
+
+
+def _is_file_mutation_tool(tool):
+    return tool in {"write_file", "str_replace"}
+
+
+def _tool_succeeded(result):
+    return result.startswith("OK:")
+
+
 def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens, think,
                stall_timeout=180, show_tokens=True, token_stats=None,
                auto_compact=True, compact_threshold=DEFAULT_COMPACT_THRESHOLD,
@@ -1385,6 +1444,8 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
     last_signature = None
     empty_retried = False
     parse_fails = 0
+    unverified_replies = 0
+    last_file_mutation_ok = None
     for step in range(1, max_steps + 1):
         print(f"\n=== step {step} ===")
         prompt_est = estimate_message_tokens(base_url, messages) if (show_tokens or auto_compact) else None
@@ -1465,18 +1526,45 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
             # No tool call -> treat as a normal chat reply and hand control back
             # to the user instead of looping autonomously (fixes "stuck in loop"
             # on conversational input like "hello").
+            if _looks_like_unverified_completion(reply):
+                unverified_replies += 1
+                if unverified_replies >= 3:
+                    print("\n[model kept claiming unverified changes, returning; please rephrase]")
+                    return
+                print("\n[model claimed file changes without a successful tool observation; asking it to verify]")
+                messages.append({"role": "assistant",
+                                 "content": "[previous reply claimed unverified file changes]"})
+                messages.append({"role": "user", "content": (
+                    "OBSERVATION:\nERROR: do not claim files were changed from memory. "
+                    "First use read_file to verify the current file, or use a write/edit "
+                    "tool and wait for an OK observation. If nothing changed, say so.")})
+                continue
             messages.append({"role": "assistant", "content": reply})
             return
         parse_fails = 0
+        unverified_replies = 0
         messages.append({"role": "assistant", "content": reply})
 
         if action["tool"] == "finish":
             answer = action.get("args", {}).get("answer", "")
+            if last_file_mutation_ok is not True and _looks_like_unverified_completion(answer):
+                unverified_replies += 1
+                print("\n[finish claimed file changes without a verified write/edit; asking it to verify]")
+                messages.append({"role": "user", "content": (
+                    "OBSERVATION:\nERROR: finish answer claims files were changed, but the "
+                    "last write/edit tool did not return OK. Use read_file to inspect the "
+                    "file or retry the write/edit, then finish only after an OK observation.")})
+                if unverified_replies >= 3:
+                    print("\n[model kept finishing without verified file changes, returning]")
+                    return
+                continue
             print("\n=== finished ===")
             print(answer)
             return
 
         result = run_tool(action, auto_yes, mcp_manager=mcp_manager)
+        if _is_file_mutation_tool(action["tool"]):
+            last_file_mutation_ok = _tool_succeeded(result)
 
         # Loop guard: if the model repeats the exact same action and gets the same
         # error several times, stop and return control instead of spinning forever.
