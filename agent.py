@@ -3,6 +3,7 @@
 
 import argparse
 import atexit
+import difflib
 import glob
 import json
 import os
@@ -29,8 +30,9 @@ MAX_READ_CHARS = 8000
 
 # Defaults for auto-launching llama-server. Override via CLI flags.
 DEFAULT_MODEL_REL = os.path.join(
-    "mymodels", "gemma-4-12b-it-GGUF", "gemma-4-12b-it-Q4_K_M.gguf"
+    "models", "gemma-4-12b-it-GGUF", "gemma-4-12b-it-Q4_K_M.gguf"
 )
+MODEL_DIR_NAMES = ("models", "mymodel", "mymodels")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 DEFAULT_NGL = 99
@@ -61,6 +63,7 @@ Tools:
 
 Rules:
 - Emit one ACTION JSON only; never use native tool_call or OpenAI tool_calls syntax.
+- Put all tool parameters inside args.
 - JSON must be valid; escape newlines in strings.
 - Use relative paths; list_dir/read_file before guessing.
 - Edit existing files with str_replace only: copy an exact unique old_string from read_file output, without line numbers.
@@ -114,6 +117,7 @@ def find_llama_roots():
     home = os.path.expanduser("~")
     candidates = [
         os.environ.get("LLAMA_CPP_DIR"),
+        script_dir,
         os.getcwd(),
         os.path.join(os.getcwd(), "llama.cpp"),
         os.path.join(os.path.dirname(script_dir), "llama.cpp"),
@@ -131,6 +135,23 @@ def _backend_order(backend):
         return [backend]
     # Vulkan is the portable default. HIP can still be selected explicitly.
     return ["vulkan", "hip"]
+
+
+def _unique_files(paths):
+    result = []
+    seen = set()
+    for path in paths:
+        path = os.path.abspath(os.path.expanduser(path))
+        key = os.path.normcase(path)
+        if key not in seen and os.path.isfile(path):
+            seen.add(key)
+            result.append(path)
+    return result
+
+
+def _is_llm_model(path):
+    name = os.path.basename(path).lower()
+    return not (name.startswith("ggml-vocab-") or name.startswith("mmproj-"))
 
 
 def resolve_server_bin(explicit_path, backend):
@@ -158,23 +179,50 @@ def resolve_server_bin(explicit_path, backend):
     )
 
 
-def resolve_model_path(explicit_path):
+def find_model_paths():
     """Find the default GGUF model near a llama.cpp checkout."""
-    if explicit_path:
-        return os.path.abspath(os.path.expanduser(explicit_path))
-
+    matches = []
     searched = []
     for root in find_llama_roots():
         preferred = os.path.join(root, DEFAULT_MODEL_REL)
         searched.append(preferred)
         if os.path.isfile(preferred):
-            return preferred
+            matches.append(preferred)
 
-        matches = sorted(glob.glob(os.path.join(root, "mymodels", "**", "*.gguf"),
-                                   recursive=True))
-        searched.append(os.path.join(root, "mymodels", "**", "*.gguf"))
-        if matches:
-            return matches[0]
+        for dirname in MODEL_DIR_NAMES:
+            pattern = os.path.join(root, dirname, "**", "*.[gG][gG][uU][fF]")
+            searched.append(pattern)
+            matches.extend(path for path in sorted(glob.glob(pattern, recursive=True))
+                           if _is_llm_model(path))
+
+    return _unique_files(matches), searched
+
+
+def choose_model_path(candidates):
+    if len(candidates) == 1 or not sys.stdin.isatty():
+        return candidates[0]
+
+    print("\nAvailable models:")
+    cwd = os.getcwd()
+    for i, path in enumerate(candidates, 1):
+        shown = os.path.relpath(path, cwd) if path.startswith(cwd + os.sep) else path
+        print(f"  {i}. {shown}")
+    while True:
+        choice = input(f"Choose model [1-{len(candidates)}] (default 1): ").strip()
+        if not choice:
+            return candidates[0]
+        if choice.isdigit() and 1 <= int(choice) <= len(candidates):
+            return candidates[int(choice) - 1]
+        print("Invalid choice.")
+
+
+def resolve_model_path(explicit_path, prompt=True):
+    if explicit_path:
+        return os.path.abspath(os.path.expanduser(explicit_path))
+
+    candidates, searched = find_model_paths()
+    if candidates:
+        return choose_model_path(candidates) if prompt else candidates[0]
 
     raise RuntimeError(
         "model file not found; pass --model-path. Searched:\n"
@@ -639,6 +687,70 @@ def write_file(args, auto_yes):
     return f"OK: wrote {len(content)} chars to {path}"
 
 
+def _strip_read_file_line_numbers(text):
+    return "\n".join(re.sub(r"^\s*\d+\|", "", line) for line in text.splitlines())
+
+
+def _str_replace_old_variants(old):
+    variants = []
+
+    def add(value):
+        if value not in variants:
+            variants.append(value)
+
+    add(old)
+    stripped = _strip_read_file_line_numbers(old)
+    if stripped != old:
+        add(stripped)
+    for value in list(variants):
+        add(value.replace("\r\n", "\n"))
+        add(value.replace("\n", "\r\n"))
+    return variants
+
+
+def _nearby_old_string_hints(content, old, max_hints=3):
+    lines = content.splitlines()
+    if not lines:
+        return ""
+
+    old_lines = [line.strip() for line in _strip_read_file_line_numbers(old).splitlines()
+                 if line.strip()]
+    query = max(old_lines, key=len, default=old.strip())
+    if not query:
+        return ""
+
+    scored = []
+    for i, line in enumerate(lines):
+        score = difflib.SequenceMatcher(None, query, line.strip()).ratio()
+        if query in line:
+            score = max(score, 0.95)
+        scored.append((score, i))
+    scored.sort(reverse=True)
+
+    snippets = []
+    used = set()
+    for score, i in scored:
+        if score < 0.35:
+            break
+        start = max(0, i - 2)
+        end = min(len(lines), i + 3)
+        key = (start, end)
+        if key in used:
+            continue
+        used.add(key)
+        snippet = "\n".join(lines[start:end])
+        if snippet:
+            snippets.append(snippet)
+        if len(snippets) >= max_hints:
+            break
+
+    if not snippets:
+        return ""
+    text = "\n\n".join(f"--- candidate {i + 1} ---\n{snippet}"
+                       for i, snippet in enumerate(snippets))
+    return "\n\nNearby exact snippets from the current file:\n" + text[:2000]
+
+
 def str_replace(args, auto_yes):
     path = args["path"]
     old = args["old_string"]
@@ -647,17 +759,28 @@ def str_replace(args, auto_yes):
         return f"ERROR: file not found: {path}"
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
-    count = content.count(old)
+    matched_old = None
+    count = 0
+    for candidate in _str_replace_old_variants(old):
+        count = content.count(candidate)
+        if count:
+            matched_old = candidate
+            break
     if count == 0:
-        return "ERROR: old_string not found. Read the file again to copy exact text."
+        return (
+            "ERROR: old_string not found.\n"
+            "Read the file again or copy a shorter exact snippet from below into old_string.\n"
+            "Do not rewrite from memory."
+            + _nearby_old_string_hints(content, old)
+        )
     if count > 1:
         return (f"ERROR: old_string matched {count} times; it must be unique. "
                 "Include more surrounding context.")
-    print(f"\n--- about to edit file: {path} (1 replacement, {len(old)}->{len(new)} chars) ---")
+    print(f"\n--- about to edit file: {path} (1 replacement, {len(matched_old)}->{len(new)} chars) ---")
     if not auto_yes and not _confirm():
         return "SKIPPED: user declined str_replace"
     with open(path, "w", encoding="utf-8") as f:
-        f.write(content.replace(old, new))
+        f.write(content.replace(matched_old, new))
     return f"OK: replaced 1 occurrence in {path}"
 
 
@@ -864,6 +987,10 @@ def _json_loads_relaxed(candidate):
         return json.loads(candidate)
     except json.JSONDecodeError:
         pass
+    try:
+        return json.loads(candidate, strict=False)
+    except json.JSONDecodeError:
+        pass
 
     # Models frequently emit raw Windows paths like ".\WorkDir\app.exe".
     # Backslashes such as \W or \h are invalid JSON escapes, so escape any
@@ -873,11 +1000,19 @@ def _json_loads_relaxed(candidate):
         return json.loads(escaped)
     except json.JSONDecodeError:
         pass
+    try:
+        return json.loads(escaped, strict=False)
+    except json.JSONDecodeError:
+        pass
 
     # Gemma-style text sometimes uses JavaScript-like object keys.
     quoted_keys = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)', r'\1"\2"\3', escaped)
     try:
         return json.loads(quoted_keys)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(quoted_keys, strict=False)
     except json.JSONDecodeError:
         return None
 
@@ -892,8 +1027,7 @@ def _normalize_action_object(obj):
             # Some models flatten args to the top level instead of nesting them
             # under "args" (e.g. {"tool":"run_shell","command":"ls"}). Accept that.
             args = {k: v for k, v in obj.items() if k != "tool"}
-        obj["args"] = args
-        return obj
+        return {"tool": obj["tool"], "args": args}
 
     name = obj.get("name") or obj.get("function")
     if isinstance(name, dict):
@@ -937,6 +1071,77 @@ def _format_action_text(action):
     return "ACTION\n" + json.dumps(action, ensure_ascii=False)
 
 
+def _loose_string_value(text, key):
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*"', text)
+    if not match:
+        return None
+
+    out = []
+    i = match.end()
+    while i < len(text):
+        ch = text[i]
+        if ch == '"':
+            rest = text[i + 1:].lstrip()
+            if not rest or rest[0] in ",}":
+                return "".join(out)
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt in "\r\n":
+                if nxt == "\r" and i + 2 < len(text) and text[i + 2] == "\n":
+                    i += 3
+                else:
+                    i += 2
+                out.append("\n")
+                continue
+            escapes = {
+                '"': '"',
+                "\\": "\\",
+                "/": "/",
+                "b": "\b",
+                "f": "\f",
+                "n": "\n",
+                "r": "\r",
+                "t": "\t",
+            }
+            if nxt in escapes:
+                out.append(escapes[nxt])
+                i += 2
+                continue
+        out.append(ch)
+        i += 1
+    return None
+
+
+def _loose_bool_value(text, key):
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*(true|false)', text, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).lower() == "true"
+
+
+def _parse_loose_action_object(text):
+    tool = _loose_string_value(text, "tool")
+    if not tool:
+        return None
+
+    args = {}
+    for key in ("path", "old_string", "new_string", "content", "command",
+                "server", "answer"):
+        value = _loose_string_value(text, key)
+        if value is not None:
+            args[key] = value
+    overwrite = _loose_bool_value(text, "overwrite")
+    if overwrite is not None:
+        args["overwrite"] = overwrite
+
+    if not args and tool not in {"list_dir"}:
+        return None
+    return {"tool": tool, "args": args}
+
+
 def _parse_gemma_tool_call(text):
     match = re.search(r"<\|tool_call\>(.*?)<tool_call\|>", text, re.DOTALL)
     if not match:
@@ -958,6 +1163,8 @@ def _parse_gemma_tool_call(text):
         return None
 
     obj = _json_loads_relaxed(candidate)
+    if obj is None:
+        obj = _parse_loose_action_object(candidate)
     if obj is None:
         return None
 
@@ -992,6 +1199,8 @@ def parse_action(text):
             return None
 
     obj = _json_loads_relaxed(candidate)
+    if obj is None:
+        obj = _parse_loose_action_object(candidate)
     return _normalize_action_object(obj)
 
 
@@ -1242,6 +1451,8 @@ def main():
                         help="path to llama-server executable (default: auto-detect)")
     parser.add_argument("--model-path", default=None,
                         help="path to the .gguf model to serve (default: auto-detect)")
+    parser.add_argument("--no-model-prompt", action="store_true",
+                        help="auto-select the first detected model instead of prompting")
     parser.add_argument("--ngl", type=int, default=DEFAULT_NGL,
                         help="number of layers to offload to GPU")
     parser.add_argument("--ctx-size", type=int, default=131072,
@@ -1289,7 +1500,8 @@ def main():
         else:
             try:
                 server_bin = resolve_server_bin(args.server_bin, args.backend)
-                model_path = resolve_model_path(args.model_path)
+                model_path = resolve_model_path(args.model_path,
+                                                prompt=not args.no_model_prompt)
             except RuntimeError as e:
                 print(f"\nError: {e}")
                 return
