@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,7 @@ Available tools:
 - str_replace: {"path": str, "old_string": str, "new_string": str}  -> EDIT an existing file by replacing one exact, unique snippet
 - write_file: {"path": str, "content": str, "overwrite": bool (optional)}  -> create a NEW file; refuses to overwrite an existing file unless overwrite=true
 - run_shell: {"command": str}  -> runs a shell command, returns stdout/stderr/exit code
+- mcp_call: {"server": str, "tool": str, "args": object (optional)}  -> call a configured MCP tool
 - finish: {"answer": str}  -> end the task and give the final answer to the user
 
 Editing files (IMPORTANT):
@@ -668,6 +670,168 @@ def run_shell(args, auto_yes):
     return f"exit_code={proc.returncode}\n{out}"
 
 
+def _gh_auth_token():
+    if shutil.which("gh") is None:
+        return None
+    try:
+        proc = subprocess.run(["gh", "auth", "token"], capture_output=True,
+                              text=True, timeout=10)
+    except Exception:
+        return None
+    token = proc.stdout.strip()
+    return token if proc.returncode == 0 and token else None
+
+
+class McpServer:
+    def __init__(self, name, spec):
+        self.name = name
+        self.spec = spec
+        self.proc = None
+        self.next_id = 1
+        self.responses = queue.Queue()
+        self.tools = []
+
+    def start(self):
+        command = self.spec.get("command")
+        if not command:
+            raise RuntimeError(f"MCP server {self.name}: missing command")
+        args = self.spec.get("args", [])
+        if isinstance(command, str) and not args:
+            cmd = shlex.split(command)
+        else:
+            cmd = [command] + list(args)
+
+        env = os.environ.copy()
+        env.update({str(k): str(v) for k, v in self.spec.get("env", {}).items()})
+        joined = " ".join(cmd)
+        if ("server-github" in joined or self.name.lower() == "github"):
+            if not env.get("GITHUB_PERSONAL_ACCESS_TOKEN") and not env.get("GITHUB_TOKEN"):
+                token = _gh_auth_token()
+                if token:
+                    env["GITHUB_PERSONAL_ACCESS_TOKEN"] = token
+
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            bufsize=1,
+        )
+        threading.Thread(target=self._reader, daemon=True).start()
+        self._request("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "mini-agent", "version": "0.1"},
+        })
+        self._notify("notifications/initialized", {})
+        listed = self._request("tools/list", {})
+        self.tools = listed.get("tools", [])
+
+    def _reader(self):
+        while self.proc and self.proc.stdout:
+            line = self.proc.stdout.readline()
+            if not line:
+                break
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "id" in msg:
+                self.responses.put(msg)
+
+    def _send(self, msg):
+        if not self.proc or self.proc.poll() is not None:
+            raise RuntimeError(f"MCP server {self.name} is not running")
+        self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+
+    def _notify(self, method, params):
+        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _request(self, method, params, timeout=30):
+        req_id = self.next_id
+        self.next_id += 1
+        self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+        deadline = time.time() + timeout
+        skipped = []
+        while time.time() < deadline:
+            try:
+                msg = self.responses.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if msg.get("id") != req_id:
+                skipped.append(msg)
+                continue
+            for item in skipped:
+                self.responses.put(item)
+            if "error" in msg:
+                raise RuntimeError(f"MCP {self.name} {method} failed: {msg['error']}")
+            return msg.get("result", {})
+        for item in skipped:
+            self.responses.put(item)
+        raise RuntimeError(f"MCP {self.name} {method} timed out")
+
+    def call_tool(self, tool, args):
+        return self._request("tools/call", {"name": tool, "arguments": args or {}}, timeout=120)
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+
+
+class McpManager:
+    def __init__(self):
+        self.servers = {}
+
+    def load_config(self, path):
+        if not path:
+            return
+        path = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isfile(path):
+            raise RuntimeError(f"MCP config not found: {path}")
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            config = json.load(f)
+        servers = config.get("mcpServers", config.get("servers", {}))
+        for name, spec in servers.items():
+            server = McpServer(name, spec)
+            server.start()
+            self.servers[name] = server
+
+    def describe_tools(self):
+        lines = []
+        for name, server in self.servers.items():
+            for tool in server.tools:
+                desc = (tool.get("description") or "").strip().replace("\n", " ")
+                lines.append(f"- {name}.{tool.get('name')}: {desc}")
+        return "\n".join(lines)
+
+    def call(self, args):
+        server_name = args["server"]
+        tool_name = args["tool"]
+        if server_name not in self.servers:
+            return f"ERROR: unknown MCP server '{server_name}'"
+        result = self.servers[server_name].call_tool(tool_name, args.get("args", {}))
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        if len(text) > MAX_OBS_CHARS:
+            text = text[:MAX_OBS_CHARS] + "\n... [truncated]"
+        return text
+
+    def stop(self):
+        for server in self.servers.values():
+            server.stop()
+
+
 def _confirm():
     try:
         ans = input("Confirm? [y/N] ").strip().lower()
@@ -740,7 +904,7 @@ def _extract_balanced(s):
     return None
 
 
-def run_tool(action, auto_yes):
+def run_tool(action, auto_yes, mcp_manager=None):
     tool = action["tool"]
     args = action.get("args", {})
     try:
@@ -754,6 +918,13 @@ def run_tool(action, auto_yes):
             return str_replace(args, auto_yes)
         if tool == "run_shell":
             return run_shell(args, auto_yes)
+        if tool == "mcp_call":
+            if not mcp_manager or not mcp_manager.servers:
+                return "ERROR: no MCP servers configured; pass --mcp-config"
+            print(f"\n--- about to call MCP tool: {args.get('server')}.{args.get('tool')} ---")
+            if not auto_yes and not _confirm():
+                return "SKIPPED: user declined mcp_call"
+            return mcp_manager.call(args)
         return f"ERROR: unknown tool '{tool}'"
     except KeyError as e:
         return f"ERROR: missing argument {e} for tool {tool}"
@@ -796,7 +967,8 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
                auto_compact=True, compact_threshold=DEFAULT_COMPACT_THRESHOLD,
                ctx_size=0, memory_file=DEFAULT_MEMORY_FILE,
                compact_keep_messages=DEFAULT_COMPACT_KEEP_MESSAGES,
-               compact_max_tokens=DEFAULT_COMPACT_MAX_TOKENS):
+               compact_max_tokens=DEFAULT_COMPACT_MAX_TOKENS,
+               mcp_manager=None):
     messages.append({"role": "user", "content": task})
     token_stats = token_stats or TokenStats(enabled=show_tokens)
     repeats = 0
@@ -894,7 +1066,7 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
             print(answer)
             return
 
-        result = run_tool(action, auto_yes)
+        result = run_tool(action, auto_yes, mcp_manager=mcp_manager)
 
         # Loop guard: if the model repeats the exact same action and gets the same
         # error several times, stop and return control instead of spinning forever.
@@ -941,6 +1113,8 @@ def main():
                              "(default: auto-detect AGENTS.md in the working directory)")
     parser.add_argument("--work-dir", default=".",
                         help="project root for tools, conventions, and .mini-agent memory")
+    parser.add_argument("--mcp-config", default=None,
+                        help="path to MCP config JSON with mcpServers")
     # llama-server lifecycle.
     parser.add_argument("--no-server", action="store_true",
                         help="do not launch llama-server; connect to an already-running one")
@@ -1021,6 +1195,14 @@ def main():
             print(f"[warning] no server reachable at {base_url}; "
                   "start one or drop --no-server")
 
+    mcp_manager = McpManager()
+    try:
+        mcp_manager.load_config(args.mcp_config)
+    except RuntimeError as e:
+        print(f"\nError: {e}")
+        stop_server(proc)
+        return
+
     print(f"mini-agent -> {base_url} (model={args.model})")
     print(f"[work dir] {os.getcwd()}")
     print('Enter a task and press Enter; use exit() or "退出" to quit.\n')
@@ -1033,6 +1215,13 @@ def main():
             f"follow these strictly):\n{conv_text}"
         )
         print(f"[loaded conventions from {conv_path}]")
+    mcp_tools = mcp_manager.describe_tools()
+    if mcp_tools:
+        base_system_content += (
+            "\n\nConfigured MCP tools. Call them via mcp_call with server, tool, and args:\n"
+            f"{mcp_tools}"
+        )
+        print("[loaded MCP tools]")
 
     def new_session_messages(print_loaded=False):
         system_content = base_system_content
@@ -1085,12 +1274,14 @@ def main():
                            ctx_size=args.ctx_size,
                            memory_file=args.memory_file,
                            compact_keep_messages=args.compact_keep_messages,
-                           compact_max_tokens=args.compact_max_tokens)
+                           compact_max_tokens=args.compact_max_tokens,
+                           mcp_manager=mcp_manager)
             except RuntimeError as e:
                 print(f"\nError: {e}")
             except KeyboardInterrupt:
                 print("\n[current task interrupted]")
     finally:
+        mcp_manager.stop()
         stop_server(proc)
 
 

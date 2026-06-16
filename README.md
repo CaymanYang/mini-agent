@@ -82,6 +82,7 @@ Use `exit()` or `退出` to quit the agent program. Use `结束任务` or simila
 | `--max-tokens` | `2048` | Max tokens generated per step (prevents long unresponsive runs) |
 | `--think` | off | Enable model reasoning/thinking; disabled by default to avoid stalls |
 | `--work-dir` | `.` | Project root for tools, conventions, and `.mini-agent` memory |
+| `--mcp-config` | none | Path to MCP config JSON with `mcpServers` |
 | `--no-server` | off | Do not launch llama-server; connect to an already-running one |
 | `--host` | `127.0.0.1` | llama-server host |
 | `--port` | `8080` | llama-server port |
@@ -133,6 +134,25 @@ Example (reuse a server you already started elsewhere):
 python agent.py --no-server --base-url http://127.0.0.1:8080/v1
 ```
 
+Example (enable GitHub MCP through `npx`):
+
+```bash
+export GITHUB_PERSONAL_ACCESS_TOKEN="$(gh auth token)"
+mkdir -p .mini-agent
+cat > .mini-agent/mcp.json <<'EOF'
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"]
+    }
+  }
+}
+EOF
+
+python3 agent.py --mcp-config .mini-agent/mcp.json
+```
+
 ## Project conventions (memory)
 
 For persistent project rules (e.g. "always run the program via `make run`", "compile HIP with `--offload-arch=gfx1150`"), put them in an `AGENTS.md` file in the working directory. On startup the agent auto-loads it and injects it into the system prompt.
@@ -163,7 +183,10 @@ Memory is relative to `--work-dir`, not the agent source directory. For example,
 - `write_file {path, content}`: create / overwrite a whole file (confirmation required by default)
 - `str_replace {path, old_string, new_string}`: local replacement in an existing file (must match uniquely, confirmation required by default); prefer this for small edits to avoid rewriting the whole file
 - `run_shell {command}`: run a command (PowerShell on Windows, confirmation required by default, 120s timeout)
+- `mcp_call {server, tool, args?}`: call a configured MCP tool
 - `finish {answer}`: end and give the final answer
+
+MCP tools require `--mcp-config`. The agent starts each configured stdio server, lists its tools, and exposes them through `mcp_call`. MCP calls ask for confirmation by default because servers may expose write operations such as creating issues or pushing files; pass `--yes` to skip confirmations.
 
 ## Protocol
 
