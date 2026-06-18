@@ -47,6 +47,142 @@ DEFAULT_COMPACT_MAX_TOKENS = 1024
 DEFAULT_MEMORY_FILE = os.path.join(".mini-agent", "memory", "session.md")
 THINKING_HEARTBEAT_SECONDS = 5
 
+
+def _color_enabled():
+    return (
+        sys.stdout.isatty()
+        and os.environ.get("NO_COLOR") is None
+        and os.environ.get("TERM") != "dumb"
+    )
+
+
+COLOR_ENABLED = _color_enabled()
+ANSI = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "cyan": "\033[36m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "red": "\033[31m",
+    "magenta": "\033[35m",
+}
+
+
+def _style(text, *styles):
+    if not COLOR_ENABLED:
+        return text
+    prefix = "".join(ANSI[s] for s in styles if s in ANSI)
+    return f"{prefix}{text}{ANSI['reset']}" if prefix else text
+
+
+def _dim(text):
+    return _style(text, "dim")
+
+
+def _bold(text):
+    return _style(text, "bold")
+
+
+def _clip(text, limit=96):
+    text = str(text).replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+
+def _indent(text, prefix="  "):
+    if not text:
+        return prefix + _dim("(no output)")
+    return "\n".join(prefix + line if line else prefix.rstrip()
+                     for line in text.splitlines())
+
+
+def ui_line(kind, detail="", color="cyan", icon=">"):
+    head = f"{_style(icon, color)} {_bold(kind)}"
+    print(f"{head} {_dim(detail)}" if detail else head, flush=True)
+
+
+def ui_notice(message, color="yellow"):
+    print(f"{_style('!', color)} {message}", flush=True)
+
+
+def ui_header(title, *details):
+    print()
+    print(_style(title, "bold", "cyan"))
+    for detail in details:
+        if detail:
+            print(f"  {_dim(detail)}")
+    print()
+
+
+def ui_step(step, max_steps, meta=None):
+    suffix = f"turn {step}/{max_steps}"
+    if meta:
+        suffix += f" · {meta}"
+    ui_line("Thinking", suffix, color="magenta", icon="*")
+
+
+def ui_tokens(message):
+    print(f"  {_dim(message)}", flush=True)
+
+
+def ui_answer(text):
+    if text:
+        print(text, flush=True)
+
+
+def summarize_action(action):
+    tool = action.get("tool", "unknown")
+    args = action.get("args", {})
+    if tool == "list_dir":
+        return "List directory", args.get("path") or "."
+    if tool == "read_file":
+        return "Read file", args.get("path", "")
+    if tool == "open_file":
+        line = args.get("line")
+        detail = args.get("path", "")
+        if line:
+            detail += f":{line}"
+        return "Open file", detail
+    if tool == "write_file":
+        return "Write file", f"{args.get('path', '')} ({len(args.get('content', ''))} chars)"
+    if tool == "str_replace":
+        old = args.get("old_string", "")
+        new = args.get("new_string", "")
+        return "Edit file", f"{args.get('path', '')} ({len(old)}->{len(new)} chars)"
+    if tool == "run_shell":
+        return "Run command", _clip(args.get("command", ""), 140)
+    if tool == "mcp_call":
+        server = args.get("server", "")
+        mcp_tool = args.get("tool", "")
+        return "Call MCP", f"{server}.{mcp_tool}".strip(".")
+    if tool == "finish":
+        return "Finish", ""
+    return tool, _clip(json.dumps(args, ensure_ascii=False), 140)
+
+
+def ui_tool(action):
+    label, detail = summarize_action(action)
+    ui_line(label, detail, color="cyan", icon=">")
+
+
+def ui_result(action, result):
+    tool = action.get("tool")
+    color = "green"
+    label = "Result"
+    if result.startswith("ERROR"):
+        color = "red"
+        label = "Error"
+    elif result.startswith("SKIPPED"):
+        color = "yellow"
+        label = "Skipped"
+    elif tool == "run_shell" and not result.startswith("exit_code=0"):
+        color = "yellow"
+
+    ui_line(label, "", color=color, icon="<")
+    print(_indent(result), flush=True)
+
 SYSTEM_PROMPT = """You are a minimal coding agent. Solve the user's task one tool call at a time.
 
 Output exactly:
@@ -209,7 +345,7 @@ def choose_model_path(candidates):
     if len(candidates) == 1 or not sys.stdin.isatty():
         return candidates[0]
 
-    print("\nAvailable models:")
+    ui_line("Available models", "", color="cyan", icon=">")
     cwd = os.getcwd()
     for i, path in enumerate(candidates, 1):
         shown = os.path.relpath(path, cwd) if path.startswith(cwd + os.sep) else path
@@ -220,7 +356,7 @@ def choose_model_path(candidates):
             return candidates[0]
         if choice.isdigit() and 1 <= int(choice) <= len(candidates):
             return candidates[int(choice) - 1]
-        print("Invalid choice.")
+        ui_notice("Invalid choice.", color="red")
 
 
 def resolve_model_path(explicit_path, prompt=True):
@@ -385,15 +521,16 @@ def compact_messages(base_url, model, messages, memory_file, keep_messages,
         {"role": "system", "content": COMPACT_PROMPT},
         {"role": "user", "content": transcript},
     ]
-    print(f"[auto-compact] summarizing history into {memory_file}")
+    ui_line("Compact memory", memory_file, color="yellow", icon="~")
     summary, _, _ = call_llm(base_url, model, compact_request,
                              max_tokens=max_tokens, think=think,
                              stop_on_action=False,
                              stall_timeout=stall_timeout,
-                             show_tokens=False)
+                             show_tokens=False,
+                             render_content=False)
     summary = summary.strip()
     if not summary:
-        print("[auto-compact] skipped: model returned empty summary")
+        ui_notice("auto-compact skipped: model returned empty summary")
         return False
     path = save_memory(memory_file, summary)
     memory_msg = {
@@ -401,7 +538,7 @@ def compact_messages(base_url, model, messages, memory_file, keep_messages,
         "content": f"Compressed session memory loaded from {path}:\n\n{summary}",
     }
     messages[:] = [system_msg, memory_msg] + recent
-    print(f"[auto-compact] wrote {path}; kept last {len(recent)} messages")
+    ui_line("Memory saved", f"{path}; kept last {len(recent)} messages", color="green", icon="<")
     return True
 
 
@@ -422,8 +559,8 @@ def start_server(server_bin, model_path, host, port, ngl, ctx_size, extra_args, 
         cmd += ["-c", str(ctx_size)]
     if extra_args:
         cmd += extra_args
-    print(f"[starting llama-server] {' '.join(cmd)}")
-    print(f"[server log] {log_path}")
+    ui_line("Starting server", _clip(" ".join(cmd), 160), color="cyan", icon=">")
+    ui_line("Server log", log_path, color="cyan", icon=">")
     log = open(log_path, "w", encoding="utf-8", errors="replace")
     # New process group so we can terminate it cleanly on Windows and POSIX.
     kwargs = {}
@@ -439,7 +576,7 @@ def start_server(server_bin, model_path, host, port, ngl, ctx_size, extra_args, 
 def wait_for_server(base_url, proc, timeout=300):
     """Poll /health until the server is ready, or fail if it exits early."""
     deadline = time.time() + timeout
-    print("[waiting for server to be ready] ", end="", flush=True)
+    print(f"{_style('*', 'magenta')} {_bold('Waiting for server')} ", end="", flush=True)
     while time.time() < deadline:
         if proc.poll() is not None:
             print()
@@ -448,7 +585,7 @@ def wait_for_server(base_url, proc, timeout=300):
                 f"check the server log for details."
             )
         if server_is_up(base_url, timeout=2.0):
-            print(" ready")
+            print(_style("ready", "green"))
             return True
         print(".", end="", flush=True)
         time.sleep(1.0)
@@ -460,7 +597,7 @@ def stop_server(proc):
     """Terminate the llama-server child process and close its log file."""
     if proc is None or proc.poll() is not None:
         return
-    print("\n[stopping llama-server]")
+    ui_line("Stopping server", "", color="yellow", icon="<")
     try:
         proc.terminate()
         try:
@@ -503,7 +640,8 @@ def _reasoning_text(delta_or_message):
 
 
 def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=True,
-             stop_on_action=True, stall_timeout=180, show_tokens=True):
+             stop_on_action=True, stall_timeout=180, show_tokens=True,
+             render_content=True):
     """Call /chat/completions. Streams tokens to stdout and returns the full assistant text."""
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
@@ -539,9 +677,10 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
         text = _format_action_text(action) if action else (message.get("content") or "")
         reasoning = _reasoning_text(message)
         if think and reasoning:
-            print(f"[thinking] {reasoning}")
-        print(text, end="", flush=True)
-        print()
+            ui_line("Thinking", reasoning, color="magenta", icon="*")
+        if render_content:
+            print(text, end="", flush=True)
+            print()
         return text, choice.get("finish_reason"), body.get("usage")
 
     # Read the HTTP stream in a background thread and hand lines to the main thread
@@ -575,6 +714,7 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
     tool_calls = {}
     printed_tool_call = False
     printed_waiting = False
+    printed_stream = False
     try:
         while True:
             try:
@@ -591,8 +731,9 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
                     if in_reasoning:
                         print(" ...", end="", flush=True)
                     else:
-                        print("[thinking...] ", end="", flush=True)
+                        print(f"{_style('*', 'magenta')} {_bold('Thinking')} ", end="", flush=True)
                         printed_waiting = True
+                    printed_stream = True
                     last_visible = time.time()
                 continue  # also gives the main thread a chance to see Ctrl+C
             last_data = time.time()
@@ -628,8 +769,9 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
                     if printed_waiting:
                         print("\n", end="", flush=True)
                         printed_waiting = False
-                    print("[tool_call]", end="", flush=True)
+                    print(f"{_style('>', 'cyan')} {_bold('Tool call')}", end="", flush=True)
                     printed_tool_call = True
+                    printed_stream = True
                     last_visible = time.time()
                 streamed_tokens += 1
                 for delta_call in delta_tool_calls:
@@ -652,9 +794,10 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
                     print("\n", end="", flush=True)
                     printed_waiting = False
                 if not in_reasoning:
-                    print("[thinking] ", end="", flush=True)
+                    print(f"{_style('*', 'magenta')} {_bold('Thinking')} ", end="", flush=True)
                     in_reasoning = True
                 print(reasoning, end="", flush=True)
+                printed_stream = True
                 streamed_tokens += 1
                 last_visible = time.time()
             piece = delta.get("content")
@@ -666,7 +809,9 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
                     print("\n", end="", flush=True)
                     in_reasoning = False
                 parts.append(piece)
-                print(piece, end="", flush=True)
+                if render_content:
+                    print(piece, end="", flush=True)
+                    printed_stream = True
                 streamed_tokens += 1
                 last_visible = time.time()
             if piece:
@@ -684,7 +829,8 @@ def call_llm(base_url, model, messages, max_tokens=2048, think=False, stream=Tru
             resp.close()
         except Exception:
             pass
-    print()
+    if render_content or printed_stream:
+        print()
     if usage is None and streamed_tokens:
         usage = {"completion_tokens": streamed_tokens, "total_tokens": streamed_tokens, "estimated": True}
     if not parts and tool_calls:
@@ -761,7 +907,8 @@ def write_file(args, auto_yes):
         return (f"ERROR: {path} already exists. To EDIT an existing file use "
                 "str_replace. To replace the entire file anyway, pass "
                 'valid JSON args with "overwrite": true.')
-    print(f"\n--- about to write file: {path} ({len(content)} chars) ---")
+    if not auto_yes:
+        ui_line("Confirm write", f"{path} ({len(content)} chars)", color="yellow", icon="?")
     if not auto_yes and not _confirm():
         return "SKIPPED: user declined write_file"
     parent = os.path.dirname(os.path.abspath(path))
@@ -869,7 +1016,9 @@ def str_replace(args, auto_yes):
     if count > 1:
         return (f"ERROR: old_string matched {count} times; it must be unique. "
                 "Include more surrounding context.")
-    print(f"\n--- about to edit file: {path} (1 replacement, {len(matched_old)}->{len(new)} chars) ---")
+    if not auto_yes:
+        ui_line("Confirm edit", f"{path} (1 replacement, {len(matched_old)}->{len(new)} chars)",
+                color="yellow", icon="?")
     if not auto_yes and not _confirm():
         return "SKIPPED: user declined str_replace"
     updated = content.replace(matched_old, new)
@@ -892,9 +1041,10 @@ def _windows_shell():
 
 def run_shell(args, auto_yes):
     command = args["command"]
-    print(f"\n--- about to run command: {command} ---")
+    if not auto_yes:
+        ui_line("Confirm command", _clip(command, 140), color="yellow", icon="?")
     if re.search(r"\bgit\s+commit\b", command):
-        print("[commit message] Prefer a concise behavior summary, not just file names.")
+        ui_notice("Commit message: prefer a concise behavior summary, not just file names.")
     if not auto_yes and not _confirm():
         return "SKIPPED: user declined run_shell"
     is_windows = os.name == "nt"
@@ -1078,7 +1228,7 @@ class McpManager:
 
 def _confirm():
     try:
-        ans = input("Confirm? [y/N] ").strip().lower()
+        ans = input(f"{_style('?', 'yellow')} Confirm? [y/N] ").strip().lower()
     except EOFError:
         return False
     return ans in ("y", "yes")
@@ -1350,7 +1500,9 @@ def run_tool(action, auto_yes, mcp_manager=None):
         if tool == "mcp_call":
             if not mcp_manager or not mcp_manager.servers:
                 return "ERROR: no MCP servers configured; pass --mcp-config"
-            print(f"\n--- about to call MCP tool: {args.get('server')}.{args.get('tool')} ---")
+            if not auto_yes:
+                ui_line("Confirm MCP", f"{args.get('server')}.{args.get('tool')}",
+                        color="yellow", icon="?")
             if not auto_yes and not _confirm():
                 return "SKIPPED: user declined mcp_call"
             return mcp_manager.call(args)
@@ -1447,21 +1599,23 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
     unverified_replies = 0
     last_file_mutation_ok = None
     for step in range(1, max_steps + 1):
-        print(f"\n=== step {step} ===")
         prompt_est = estimate_message_tokens(base_url, messages) if (show_tokens or auto_compact) else None
         context_limit = ctx_size or DEFAULT_CONTEXT_LIMIT
+        meta = None
+        if show_tokens and prompt_est is not None:
+            meta = f"input~{prompt_est}; session {token_stats.summary()}"
+        ui_step(step, max_steps, meta=meta)
         if (auto_compact and prompt_est is not None
                 and prompt_est >= int(context_limit * compact_threshold)):
             if compact_messages(base_url, model, messages, memory_file,
                                 compact_keep_messages, compact_max_tokens, think,
                                 stall_timeout):
                 prompt_est = estimate_message_tokens(base_url, messages)
-        if show_tokens and prompt_est is not None:
-            print(f"[tokens input~{prompt_est}; session {token_stats.summary()}]")
         reply, finish_reason, usage = call_llm(base_url, model, messages,
                                                max_tokens=max_tokens, think=think,
                                                stall_timeout=stall_timeout,
-                                               show_tokens=show_tokens)
+                                               show_tokens=show_tokens,
+                                               render_content=False)
         if show_tokens:
             if usage:
                 if usage.get("estimated") and prompt_est is not None:
@@ -1472,10 +1626,10 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
                 prompt = usage.get("prompt_tokens", 0)
                 completion = usage.get("completion_tokens", 0)
                 total = usage.get("total_tokens", prompt + completion)
-                print(f"[tokens step {approx}prompt={prompt}, completion={completion}, total={total}; "
-                      f"session {token_stats.summary()}]")
+                ui_tokens(f"tokens {approx}prompt={prompt}, completion={completion}, "
+                          f"total={total}; session {token_stats.summary()}")
             elif prompt_est is not None:
-                print(f"[tokens step prompt~{prompt_est}; completion unavailable]")
+                ui_tokens(f"tokens prompt~{prompt_est}; completion unavailable")
 
         # The model occasionally returns an empty assistant turn; retry once before
         # giving up so a single stray empty reply does not silently drop the task.
@@ -1483,9 +1637,9 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
         if not reply.strip():
             if not empty_retried:
                 empty_retried = True
-                print("[model returned an empty reply, retrying...]")
+                ui_notice("Model returned an empty reply, retrying...")
                 continue
-            print("[model returned an empty reply again, please retry or rephrase]")
+            ui_notice("Model returned an empty reply again, please retry or rephrase.", color="red")
             return
         empty_retried = False
 
@@ -1494,7 +1648,7 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
             if "ACTION" in reply:
                 parse_fails += 1
                 if parse_fails >= 3:
-                    print("\n[could not parse an action 3 times, returning; please rephrase]")
+                    ui_notice("Could not parse an action 3 times; please rephrase.", color="red")
                     return
                 # Keep a short placeholder (not the huge broken blob) so history
                 # stays small and role alternation is preserved.
@@ -1503,8 +1657,7 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
                     # limit (typically a whole-file write_file). Raise the budget and
                     # steer toward a smaller, surgical edit.
                     max_tokens = min(max_tokens * 2, 16384)
-                    print(f"\n[action was cut off at the token limit; raising budget to "
-                          f"{max_tokens} and asking for a smaller edit]")
+                    ui_notice(f"Action was cut off at the token limit; raising budget to {max_tokens}.")
                     messages.append({"role": "assistant",
                                      "content": "[previous action was cut off at the token limit]"})
                     messages.append({"role": "user", "content": (
@@ -1513,7 +1666,7 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
                         "write_file. Make a small, targeted change with str_replace, or write "
                         "the file in several smaller str_replace steps.")})
                     continue
-                print("\n[could not parse the ACTION JSON, asking the model to fix it]")
+                ui_notice("Could not parse ACTION JSON; asking the model to fix it.")
                 messages.append({"role": "assistant",
                                  "content": "[previous action was not valid JSON]"})
                 messages.append({"role": "user", "content": (
@@ -1529,9 +1682,9 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
             if _looks_like_unverified_completion(reply):
                 unverified_replies += 1
                 if unverified_replies >= 3:
-                    print("\n[model kept claiming unverified changes, returning; please rephrase]")
+                    ui_notice("Model kept claiming unverified changes; please rephrase.", color="red")
                     return
-                print("\n[model claimed file changes without a successful tool observation; asking it to verify]")
+                ui_notice("Model claimed file changes without a successful tool observation; asking it to verify.")
                 messages.append({"role": "assistant",
                                  "content": "[previous reply claimed unverified file changes]"})
                 messages.append({"role": "user", "content": (
@@ -1540,6 +1693,7 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
                     "tool and wait for an OK observation. If nothing changed, say so.")})
                 continue
             messages.append({"role": "assistant", "content": reply})
+            ui_answer(reply)
             return
         parse_fails = 0
         unverified_replies = 0
@@ -1549,19 +1703,20 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
             answer = action.get("args", {}).get("answer", "")
             if last_file_mutation_ok is not True and _looks_like_unverified_completion(answer):
                 unverified_replies += 1
-                print("\n[finish claimed file changes without a verified write/edit; asking it to verify]")
+                ui_notice("Finish claimed file changes without a verified write/edit; asking it to verify.")
                 messages.append({"role": "user", "content": (
                     "OBSERVATION:\nERROR: finish answer claims files were changed, but the "
                     "last write/edit tool did not return OK. Use read_file to inspect the "
                     "file or retry the write/edit, then finish only after an OK observation.")})
                 if unverified_replies >= 3:
-                    print("\n[model kept finishing without verified file changes, returning]")
+                    ui_notice("Model kept finishing without verified file changes.", color="red")
                     return
                 continue
-            print("\n=== finished ===")
-            print(answer)
+            ui_line("Done", "", color="green", icon="<")
+            ui_answer(answer)
             return
 
+        ui_tool(action)
         result = run_tool(action, auto_yes, mcp_manager=mcp_manager)
         if _is_file_mutation_tool(action["tool"]):
             last_file_mutation_ok = _tool_succeeded(result)
@@ -1575,20 +1730,20 @@ def agent_loop(base_url, model, task, messages, auto_yes, max_steps, max_tokens,
             repeats = 0
         last_signature = signature
         if repeats >= 2:
-            print("\n[detected a repeated failing action, returning; please adjust the instruction]")
+            ui_notice("Detected a repeated failing action; please adjust the instruction.", color="red")
             return
 
         if len(result) > MAX_OBS_CHARS:
             result = result[:MAX_OBS_CHARS] + "\n... [truncated]"
         # Show command output in full (that's the point of running it); keep a short
         # preview for other tools so the console doesn't flood with file contents.
-        if action["tool"] == "run_shell":
-            print(f"\n[observation]\n{result}")
-        else:
-            print(f"\n[observation]\n{result[:500]}{'...' if len(result) > 500 else ''}")
+        shown_result = result if action["tool"] == "run_shell" else (
+            result[:500] + ("..." if len(result) > 500 else "")
+        )
+        ui_result(action, shown_result)
         messages.append({"role": "user", "content": f"OBSERVATION:\n{result}"})
 
-    print("\n[reached max steps, stopping]")
+    ui_notice("Reached max steps, stopping.", color="red")
 
 
 def main():
@@ -1660,7 +1815,7 @@ def main():
 
     work_dir = os.path.abspath(os.path.expanduser(args.work_dir))
     if not os.path.isdir(work_dir):
-        print(f"\nError: work directory not found: {work_dir}")
+        ui_notice(f"Error: work directory not found: {work_dir}", color="red")
         return
     os.chdir(work_dir)
 
@@ -1669,19 +1824,19 @@ def main():
     proc = None
     if not args.no_server:
         if server_is_up(base_url):
-            print(f"[llama-server already running at {base_url}, reusing it]")
+            ui_line("Server ready", f"{base_url} (reusing existing process)", color="green", icon="<")
         else:
             try:
                 server_bin = resolve_server_bin(args.server_bin, args.backend)
                 model_path = resolve_model_path(args.model_path,
                                                 prompt=not args.no_model_prompt)
             except RuntimeError as e:
-                print(f"\nError: {e}")
+                ui_notice(f"Error: {e}", color="red")
                 return
             log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.log")
-            print(f"[backend] {args.backend}")
-            print(f"[server] {server_bin}")
-            print(f"[model] {model_path}")
+            ui_line("Backend", args.backend, color="cyan", icon=">")
+            ui_line("Server binary", server_bin, color="cyan", icon=">")
+            ui_line("Model", model_path, color="cyan", icon=">")
             proc = start_server(server_bin, model_path, args.host, args.port,
                                 args.ngl, args.ctx_size, args.server_arg, log_path)
             atexit.register(stop_server, proc)
@@ -1689,24 +1844,22 @@ def main():
                 wait_for_server(base_url, proc, timeout=args.server_timeout)
             except RuntimeError as e:
                 stop_server(proc)
-                print(f"\nError: {e}")
+                ui_notice(f"Error: {e}", color="red")
                 return
     else:
         if not server_is_up(base_url):
-            print(f"[warning] no server reachable at {base_url}; "
-                  "start one or drop --no-server")
+            ui_notice(f"No server reachable at {base_url}; start one or drop --no-server")
 
     mcp_manager = McpManager()
     try:
         mcp_manager.load_config(args.mcp_config)
     except RuntimeError as e:
-        print(f"\nError: {e}")
+        ui_notice(f"Error: {e}", color="red")
         stop_server(proc)
         return
 
-    print(f"mini-agent -> {base_url} (model={args.model})")
-    print(f"[work dir] {os.getcwd()}")
-    print('Enter a task and press Enter; use exit() or "退出" to quit.\n')
+    ui_header("mini-agent", f"{base_url} · model={args.model}", f"work dir: {os.getcwd()}")
+    ui_line("Ready", 'Enter a task; use exit() or "退出" to quit.', color="green", icon="<")
 
     base_system_content = f"{SYSTEM_PROMPT}\n\nWorking directory: {os.getcwd()}\nAll relative paths resolve against this directory."
     conv_path, conv_text = load_conventions(args.notes)
@@ -1715,14 +1868,14 @@ def main():
             f"\n\nProject conventions (from {os.path.basename(conv_path)}; "
             f"follow these strictly):\n{conv_text}"
         )
-        print(f"[loaded conventions from {conv_path}]")
+        ui_line("Loaded conventions", conv_path, color="green", icon="<")
     mcp_tools = mcp_manager.describe_tools()
     if mcp_tools:
         base_system_content += (
             "\n\nConfigured MCP tools. Call them via mcp_call with server, tool, and args:\n"
             f"{mcp_tools}"
         )
-        print("[loaded MCP tools]")
+        ui_line("Loaded MCP tools", "", color="green", icon="<")
 
     def new_session_messages(print_loaded=False):
         system_content = base_system_content
@@ -1733,7 +1886,7 @@ def main():
                 f"compressed prior context):\n{memory_text}"
             )
             if print_loaded:
-                print(f"[loaded memory from {args.memory_file}]")
+                ui_line("Loaded memory", args.memory_file, color="green", icon="<")
         return [{"role": "system", "content": system_content}]
 
     messages = new_session_messages(print_loaded=True)
@@ -1743,12 +1896,13 @@ def main():
             try:
                 task = input("task> ").strip()
             except (EOFError, KeyboardInterrupt):
-                print("\nbye")
+                print()
+                ui_line("Bye", "", color="green", icon="<")
                 break
             if not task:
                 continue
             if is_exit_command(task):
-                print("bye")
+                ui_line("Bye", "", color="green", icon="<")
                 break
             if is_end_session_command(task):
                 if len(messages) > 1 and args.auto_compact:
@@ -1759,10 +1913,10 @@ def main():
                                          think=args.think,
                                          stall_timeout=args.stall_timeout)
                     except RuntimeError as e:
-                        print(f"[session memory save failed: {e}]")
+                        ui_notice(f"Session memory save failed: {e}", color="red")
                 messages = new_session_messages(print_loaded=True)
                 token_stats = TokenStats(enabled=args.show_tokens)
-                print("[session ended; waiting for a new task]")
+                ui_line("Session ended", "waiting for a new task", color="green", icon="<")
                 continue
             try:
                 agent_loop(base_url, args.model, task, messages, args.yes,
@@ -1778,9 +1932,9 @@ def main():
                            compact_max_tokens=args.compact_max_tokens,
                            mcp_manager=mcp_manager)
             except RuntimeError as e:
-                print(f"\nError: {e}")
+                ui_notice(f"Error: {e}", color="red")
             except KeyboardInterrupt:
-                print("\n[current task interrupted]")
+                ui_notice("Current task interrupted.")
     finally:
         mcp_manager.stop()
         stop_server(proc)
